@@ -19,13 +19,13 @@ Uses [Xray](https://github.com/XTLS/Xray-core) VLESS protocol with REALITY — t
 ### Option 1: Run on existing server
 
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USER/xray-vless-reality/main/vpn-setup.sh | bash
+curl -sL https://raw.githubusercontent.com/AlexanderGal86/xray-vless-reality/main/vpn-setup.sh | bash
 ```
 
 Or clone and run:
 
 ```bash
-git clone https://github.com/YOUR_USER/xray-vless-reality.git
+git clone https://github.com/AlexanderGal86/xray-vless-reality.git
 bash xray-vless-reality/vpn-setup.sh
 ```
 

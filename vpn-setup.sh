@@ -50,7 +50,13 @@ echo "[+] REALITY keys generated"
 echo "[+] Client UUID: $CLIENT_UUID"
 
 # ── 5. Create directories ───────────────────────────────
-mkdir -p /opt/vpn-dashboard/templates /var/log/xray
+mkdir -p /opt/vpn-dashboard/templates /opt/vpn-dashboard/static /var/log/xray
+
+# ── 5b. Download Chart.js (served locally due to CSP) ───
+echo "[*] Downloading Chart.js..."
+curl -sL https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js \
+  -o /opt/vpn-dashboard/static/chart.min.js
+echo "[+] Chart.js downloaded"
 
 # ── 6. Sysctl — BBR and network optimization ────────────
 echo "[*] Applying network optimizations..."
@@ -167,9 +173,10 @@ echo "[+] Xray config written"
 echo "[*] Writing dashboard..."
 cat > /opt/vpn-dashboard/app.py << 'APPEOF'
 #!/usr/bin/env python3
-"""VPN Dashboard"""
+"""VPN Dashboard — Xray VLESS+REALITY management"""
 
 import json, os, subprocess, uuid, time, re, threading
+from collections import deque
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request, Response
 from flask_limiter import Limiter
@@ -196,6 +203,7 @@ def security_headers(response):
 XRAY_CONFIG = '/usr/local/etc/xray/config.json'
 CLIENTS_DB = '/opt/vpn-dashboard/clients.json'
 ACCESS_LOG = '/var/log/xray/access.log'
+METRICS_FILE = '/opt/vpn-dashboard/metrics_history.json'
 SERVER_IP = '__SERVER_IP__'
 SERVER_PORT = 443
 REALITY_SNI = 'www.google.com'
@@ -204,6 +212,44 @@ REALITY_PBK = '__REALITY_PBK__'
 REALITY_SID = '__REALITY_SID__'
 XRAY_API = '127.0.0.1:10085'
 NET_IFACE = '__NET_IFACE__'
+
+metrics_history = deque(maxlen=2880)
+_prev_net = {'tx': 0, 'rx': 0, 'ts': 0}
+
+def metrics_collector():
+    global _prev_net
+    if os.path.exists(METRICS_FILE):
+        try:
+            with open(METRICS_FILE) as f:
+                for item in json.load(f): metrics_history.append(item)
+        except Exception: pass
+    save_counter = 0
+    while True:
+        try:
+            cpu = psutil.cpu_percent(interval=1)
+            mem = psutil.virtual_memory()
+            net = psutil.net_io_counters(pernic=True)
+            ens = net.get(NET_IFACE, psutil.net_io_counters())
+            now = time.time()
+            dt = now - _prev_net['ts'] if _prev_net['ts'] else 30
+            tx_rate = max(0, (ens.bytes_sent - _prev_net['tx']) / dt) if _prev_net['tx'] else 0
+            rx_rate = max(0, (ens.bytes_recv - _prev_net['rx']) / dt) if _prev_net['rx'] else 0
+            _prev_net = {'tx': ens.bytes_sent, 'rx': ens.bytes_recv, 'ts': now}
+            conns = 0
+            try:
+                for c in psutil.net_connections('tcp'):
+                    if c.laddr and c.laddr.port == 443 and c.status == 'ESTABLISHED': conns += 1
+            except Exception: pass
+            metrics_history.append({'ts':int(now),'cpu':cpu,'mem':mem.percent,
+                'tx':int(tx_rate),'rx':int(rx_rate),'conns':conns})
+            save_counter += 1
+            if save_counter >= 10:
+                save_counter = 0
+                try:
+                    with open(METRICS_FILE, 'w') as f: json.dump(list(metrics_history), f)
+                except Exception: pass
+        except Exception: pass
+        time.sleep(30)
 
 def load_json(path, default=None):
     try:
@@ -294,6 +340,36 @@ def api_system():
         'uptime':uptime,'net_tx':ens.bytes_sent,'net_rx':ens.bytes_recv,
         'net_pkt_tx':ens.packets_sent,'net_pkt_rx':ens.packets_recv,'xray':xray_active,'connections':conns})
 
+@app.route('/api/history')
+def api_history():
+    r = request.args.get('range', '1h')
+    cutoff = time.time() - {'1h': 3600, '6h': 21600, '24h': 86400}.get(r, 3600)
+    return jsonify([m for m in metrics_history if m['ts'] >= cutoff])
+
+@app.route('/api/netflow/stats')
+def api_netflow_stats():
+    entries = parse_access_log(500)
+    hourly = {}
+    for e in entries:
+        hour = e['time'][:13]
+        hourly[hour] = hourly.get(hour, 0) + 1
+    protos = {}
+    for e in entries:
+        protos[e['proto']] = protos.get(e['proto'], 0) + 1
+    dests = {}
+    for e in entries:
+        host = e['dest'].rsplit(':', 1)[0]
+        dests[host] = dests.get(host, 0) + 1
+    top_dests = sorted(dests.items(), key=lambda x: -x[1])[:10]
+    clients = {}
+    for e in entries:
+        clients[e['email']] = clients.get(e['email'], 0) + 1
+    return jsonify({
+        'hourly': [{'hour': k, 'count': v} for k, v in sorted(hourly.items())],
+        'protocols': protos,
+        'top_destinations': [{'host': h, 'count': c} for h, c in top_dests],
+        'per_client': [{'email': k, 'count': v} for k, v in sorted(clients.items(), key=lambda x: -x[1])]})
+
 @app.route('/api/clients')
 def api_clients():
     config = load_json(XRAY_CONFIG); db = load_json(CLIENTS_DB, {}); traffic = client_traffic()
@@ -359,6 +435,7 @@ def api_restart_xray():
 
 if __name__ == '__main__':
     if not os.path.exists(CLIENTS_DB): save_json(CLIENTS_DB, {})
+    threading.Thread(target=metrics_collector, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False)
 APPEOF
 
@@ -375,6 +452,7 @@ import urllib.request, base64
 # Write the HTML template inline
 " 2>/dev/null || true
 
+cp /opt/vpn-dashboard/templates/index.html /opt/vpn-dashboard/templates/index.html.bak 2>/dev/null || true
 cat > /opt/vpn-dashboard/templates/index.html << 'HTMLEOF'
 <!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VPN Dashboard</title>
 <style>
@@ -391,6 +469,25 @@ nav button:hover{color:var(--text);background:var(--card)}
 nav button.active{color:var(--blue);background:rgba(59,130,246,.12)}
 main{max-width:1280px;margin:0 auto;padding:24px}
 section{display:none}section.active{display:block}
+.status-bar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.status-item{background:var(--card);border-radius:10px;padding:10px 16px;display:flex;align-items:center;gap:8px;flex:1;min-width:120px}
+.status-dot{width:8px;height:8px;border-radius:50%}
+.status-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
+.status-value{font-size:16px;font-weight:700}
+.range-bar{display:flex;gap:4px}
+.range-btn{background:var(--card);border:1px solid transparent;color:var(--text2);padding:6px 16px;cursor:pointer;font-size:12px;border-radius:6px;transition:.15s}
+.range-btn:hover{color:var(--text);border-color:var(--card2)}
+.range-btn.active{color:var(--blue);background:rgba(59,130,246,.12);border-color:rgba(59,130,246,.3)}
+.charts-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+.chart-card{background:var(--card);border-radius:12px;padding:16px;border:1px solid transparent;transition:.2s}
+.chart-card:hover{border-color:var(--card2)}
+.chart-title{font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.chart-title .live-val{font-size:18px;font-weight:700;color:var(--text);text-transform:none;letter-spacing:0}
+.chart-wrap{position:relative;height:180px}
+.nf-charts{display:grid;grid-template-columns:2fr 1fr 2fr;gap:16px;margin-bottom:20px}
+.nf-chart-card{background:var(--card);border-radius:12px;padding:16px}
+.nf-chart-wrap{position:relative;height:200px}
+.doughnut-wrap{position:relative;height:200px;display:flex;align-items:center;justify-content:center}
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:20px}
 .stat-card{background:var(--card);border-radius:12px;padding:14px;border:1px solid transparent;transition:.2s}
 .stat-card:hover{border-color:var(--card2)}
@@ -440,42 +537,149 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 .client-stat-label{font-size:10px;color:var(--text2);text-transform:uppercase}
 .client-stat-val{font-size:13px;font-weight:600}
 .client-actions{display:flex;gap:8px}
-@media(max-width:640px){header{padding:6px 10px;gap:6px}main{padding:10px}.stats{grid-template-columns:1fr 1fr;gap:8px}.stat-card{padding:12px}.stat-value{font-size:20px}.stat-label{font-size:10px}nav button{padding:6px 8px;font-size:12px}td,th{padding:6px 8px;font-size:11px}.mono{font-size:10px}.toolbar h2{font-size:14px}.btn{padding:6px 12px;font-size:12px}.btn-sm{padding:4px 8px;font-size:11px}.modal{padding:16px;border-radius:12px;margin:8px}.modal-overlay{padding:8px}.qr-wrap svg{width:200px;height:200px}.link-box{font-size:10px;padding:10px}}
-@media(max-width:380px){.stats{grid-template-columns:1fr}.stat-value{font-size:18px}}
+@media(max-width:768px){.charts-grid,.nf-charts{grid-template-columns:1fr}.chart-wrap,.nf-chart-wrap{height:150px}.doughnut-wrap{height:180px}}
+@media(max-width:640px){header{padding:6px 10px;gap:6px}main{padding:10px}.stats{grid-template-columns:1fr 1fr;gap:8px}.stat-card{padding:12px}.stat-value{font-size:20px}.stat-label{font-size:10px}nav button{padding:6px 8px;font-size:12px}td,th{padding:6px 8px;font-size:11px}.mono{font-size:10px}.toolbar h2{font-size:14px}.btn{padding:6px 12px;font-size:12px}.btn-sm{padding:4px 8px;font-size:11px}.modal{padding:16px;border-radius:12px;margin:8px}.modal-overlay{padding:8px}.qr-wrap svg{width:200px;height:200px}.link-box{font-size:10px;padding:10px}.status-bar{gap:6px}.status-item{padding:8px 10px;min-width:90px}.status-value{font-size:14px}.chart-wrap{height:130px}}
+@media(max-width:380px){.status-bar{flex-direction:column}.chart-wrap{height:120px}}
 </style></head><body>
 <header><h1><span>&#9670;</span> VPN Dashboard</h1><nav><button class="active" data-tab="overview">Обзор</button><button data-tab="clients">Клиенты</button><button data-tab="netflow">Netflow</button></nav></header>
 <main>
-<section id="overview" class="active"><div class="stats" id="sys-stats"></div><div class="toolbar"><h2>Сеть</h2><button class="btn btn-sm btn-ghost" onclick="restartXray()">Перезапустить Xray</button></div><div class="stats" id="net-stats"></div></section>
+<section id="overview" class="active">
+<div class="status-bar" id="status-bar"></div>
+<div class="toolbar"><h2>Мониторинг</h2><div class="range-bar" id="range-bar"><button class="range-btn active" data-r="1h">1ч</button><button class="range-btn" data-r="6h">6ч</button><button class="range-btn" data-r="24h">24ч</button></div></div>
+<div class="charts-grid">
+<div class="chart-card"><div class="chart-title"><span>CPU</span><span class="live-val blue" id="live-cpu"></span></div><div class="chart-wrap"><canvas id="chart-cpu"></canvas></div></div>
+<div class="chart-card"><div class="chart-title"><span>RAM</span><span class="live-val purple" id="live-mem"></span></div><div class="chart-wrap"><canvas id="chart-mem"></canvas></div></div>
+<div class="chart-card"><div class="chart-title"><span>Сеть</span><span class="live-val" id="live-net"></span></div><div class="chart-wrap"><canvas id="chart-net"></canvas></div></div>
+<div class="chart-card"><div class="chart-title"><span>Подключения</span><span class="live-val green" id="live-conns"></span></div><div class="chart-wrap"><canvas id="chart-conns"></canvas></div></div>
+</div>
+<div class="toolbar"><h2>Диск</h2><button class="btn btn-sm btn-ghost" onclick="restartXray()">Перезапустить Xray</button></div>
+<div class="stats" id="disk-stats"></div>
+<div class="toolbar"><h2>Трафик клиентов</h2></div>
+<div class="chart-card" style="margin-bottom:20px"><div class="chart-wrap" style="height:auto;min-height:80px"><canvas id="chart-traffic"></canvas></div></div>
+</section>
 <section id="clients"><div class="toolbar"><h2>Клиенты VPN</h2><button class="btn btn-blue" onclick="showAddClient()">+ Добавить</button></div><div id="clients-list"></div></section>
-<section id="netflow"><div class="toolbar"><h2>Netflow / Access Log</h2><button class="btn btn-sm btn-ghost" onclick="loadNetflow()">Обновить</button></div><div class="filter-row"><input type="search" id="nf-search" placeholder="Фильтр по IP, домену, email..." oninput="filterNetflow()"></div><div class="table-wrap"><table><thead><tr><th>Время</th><th>Источник</th><th>Статус</th><th>Назначение</th><th>Маршрут</th><th>Клиент</th></tr></thead><tbody id="nf-table"></tbody></table></div></section>
+<section id="netflow">
+<div class="toolbar"><h2>Netflow / Access Log</h2><button class="btn btn-sm btn-ghost" onclick="loadNetflow()">Обновить</button></div>
+<div class="nf-charts">
+<div class="nf-chart-card"><div class="chart-title">Подключения по часам</div><div class="nf-chart-wrap"><canvas id="chart-nf-hourly"></canvas></div></div>
+<div class="nf-chart-card"><div class="chart-title">Протоколы</div><div class="doughnut-wrap"><canvas id="chart-nf-proto"></canvas></div></div>
+<div class="nf-chart-card"><div class="chart-title">Топ направления</div><div class="nf-chart-wrap"><canvas id="chart-nf-dests"></canvas></div></div>
+</div>
+<div class="filter-row"><input type="search" id="nf-search" placeholder="Фильтр по IP, домену, email..." oninput="filterNetflow()"></div>
+<div class="table-wrap"><table><thead><tr><th>Время</th><th>Источник</th><th>Статус</th><th>Назначение</th><th>Маршрут</th><th>Клиент</th></tr></thead><tbody id="nf-table"></tbody></table></div>
+</section>
 </main>
 <div class="modal-overlay" id="modal-add"><div class="modal"><button class="modal-close" onclick="closeModal('modal-add')">&times;</button><h3>Новый клиент</h3><div class="form-group"><label>Имя устройства</label><input type="text" id="new-name" placeholder="Телефон, Ноутбук и т.д."></div><button class="btn btn-blue" onclick="addClient()">Создать</button></div></div>
 <div class="modal-overlay" id="modal-detail"><div class="modal"><button class="modal-close" onclick="closeModal('modal-detail')">&times;</button><h3 id="detail-title">Клиент</h3><div id="detail-qr" class="qr-wrap"></div><label>Ссылка для импорта (скопируй в v2rayNG):</label><div class="link-box" id="detail-link"><button class="btn btn-sm btn-ghost copy-btn" onclick="copyLink()">Копировать</button><span id="detail-link-text"></span></div><details style="margin-top:12px"><summary style="cursor:pointer;color:var(--text2);font-size:13px">Параметры вручную</summary><table style="margin-top:8px;font-size:12px" id="detail-params"></table></details></div></div>
+<script src="/static/chart.min.js"></script>
 <script>
-let netflowData=[],currentClients=[];
-document.querySelectorAll('nav button').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.tab).classList.add('active');if(b.dataset.tab==='clients')loadClients();if(b.dataset.tab==='netflow')loadNetflow()})});
+/* NOTE: All user-supplied data is escaped via esc() before DOM insertion */
+let netflowData=[],currentClients=[],currentRange='1h';
+let chartCpu,chartMem,chartNet,chartConns,chartTraffic;
+let chartNfHourly,chartNfProto,chartNfDests;
+let prevNetTx=0,prevNetRx=0,prevNetTs=0;
 function fmtB(b){if(!b||b===0)return'0 B';const u=['B','KB','MB','GB','TB'],i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
-function fmtU(s){const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);if(d>0)return d+'д '+h+'ч '+m+'м';if(h>0)return h+'ч '+m+'м';return m+'м'}
-function pC(p){return p>90?'var(--red)':p>70?'var(--amber)':'var(--blue)'}
-function sC(l,v,c,s,p){let h='<div class="stat-card"><div class="stat-label">'+l+'</div><div class="stat-value '+(c||'')+'">'+v+'</div>';if(s)h+='<div class="stat-sub">'+s+'</div>';if(p!==undefined)h+='<div class="pbar"><div class="pbar-fill" style="width:'+p+'%;background:'+pC(p)+'"></div></div>';return h+'</div>'}
+function fmtU(s){const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);if(d>0)return d+'д '+h+'ч';if(h>0)return h+'ч '+m+'м';return m+'м'}
+function fmtTime(ts){const d=new Date(ts*1000);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-async function loadSystem(){try{const r=await fetch('/api/system'),d=await r.json();document.getElementById('sys-stats').innerHTML=sC('Xray',d.xray?'Active':'Down',d.xray?'green':'red',d.connections+' подключений')+sC('Uptime',fmtU(d.uptime),'blue')+sC('CPU',d.cpu+'%','',d.cores+' ядер',d.cpu)+sC('RAM',fmtB(d.mem_used),'',fmtB(d.mem_used)+' / '+fmtB(d.mem_total),d.mem_pct)+sC('Диск',d.disk_pct+'%','',fmtB(d.disk_used)+' / '+fmtB(d.disk_total),d.disk_pct);document.getElementById('net-stats').innerHTML=sC('Отправлено',fmtB(d.net_tx),'purple',d.net_pkt_tx.toLocaleString()+' пакетов')+sC('Получено',fmtB(d.net_rx),'blue',d.net_pkt_rx.toLocaleString()+' пакетов')}catch(e){}}
-async function loadClients(){try{const r=await fetch('/api/clients');currentClients=await r.json();const el=document.getElementById('clients-list');if(!currentClients.length){el.textContent='Нет клиентов';el.style.cssText='text-align:center;color:var(--text2);padding:32px';return}el.style.cssText='';el.innerHTML=currentClients.map(c=>'<div class="client-card"><div class="client-header"><div><div class="client-name">'+esc(c.name)+'</div><div class="client-email">'+esc(c.email)+'</div></div><span class="badge badge-green" style="font-size:10px">'+esc(c.created)+'</span></div><div class="client-stats"><div><div class="client-stat-label">Upload</div><div class="client-stat-val" style="color:var(--purple)">'+fmtB(c.up)+'</div></div><div><div class="client-stat-label">Download</div><div class="client-stat-val" style="color:var(--blue)">'+fmtB(c.down)+'</div></div><div><div class="client-stat-label">Всего</div><div class="client-stat-val">'+fmtB(c.up+c.down)+'</div></div></div><div class="client-actions"><button class="btn btn-sm btn-ghost" style="flex:1" onclick="showDetail(\''+c.id+'\')">Конфиг / QR</button><button class="btn btn-sm btn-red" onclick="delClient(\''+c.id+'\',\''+esc(c.name)+'\')">Удалить</button></div></div>').join('')}catch(e){}}
+Chart.defaults.color='#94a3b8';Chart.defaults.borderColor='rgba(71,85,105,0.3)';Chart.defaults.font.family='system-ui,-apple-system,sans-serif';Chart.defaults.font.size=11;
+function makeGrad(ctx,color){const g=ctx.createLinearGradient(0,0,0,ctx.canvas.clientHeight||180);g.addColorStop(0,color.replace(')',',0.25)').replace('rgb','rgba'));g.addColorStop(1,color.replace(')',',0.02)').replace('rgb','rgba'));return g}
+const ttStyle={backgroundColor:'#1e293b',titleColor:'#f1f5f9',bodyColor:'#94a3b8',borderColor:'#475569',borderWidth:1,cornerRadius:8,padding:10};
+function createLineChart(id,color,unit,isMulti){
+    const ctx=document.getElementById(id).getContext('2d');
+    const ds=isMulti?[
+        {label:'TX',data:[],borderColor:'#a855f7',backgroundColor:makeGrad(ctx,'rgb(168,85,247)'),fill:true,tension:.4,pointRadius:0,borderWidth:2},
+        {label:'RX',data:[],borderColor:'#3b82f6',backgroundColor:makeGrad(ctx,'rgb(59,130,246)'),fill:true,tension:.4,pointRadius:0,borderWidth:2}
+    ]:[{label:'',data:[],borderColor:color,backgroundColor:makeGrad(ctx,color),fill:true,tension:.4,pointRadius:0,borderWidth:2}];
+    return new Chart(ctx,{type:'line',data:{labels:[],datasets:ds},options:{
+        responsive:true,maintainAspectRatio:false,animation:{duration:300},interaction:{intersect:false,mode:'index'},
+        scales:{x:{display:true,grid:{display:false},ticks:{maxTicksLimit:6}},y:{beginAtZero:true,grid:{color:'rgba(71,85,105,0.15)'},ticks:{maxTicksLimit:5,callback:v=>unit==='bytes'?fmtB(v)+'/s':v+unit}}},
+        plugins:{legend:{display:isMulti,labels:{boxWidth:10,padding:8}},tooltip:{...ttStyle,callbacks:{label:i=>i.dataset.label+': '+(unit==='bytes'?fmtB(i.raw)+'/s':i.raw+unit)}}}}});
+}
+function initCharts(){
+    chartCpu=createLineChart('chart-cpu','rgb(59,130,246)','%',false);
+    chartMem=createLineChart('chart-mem','rgb(168,85,247)','%',false);
+    chartNet=createLineChart('chart-net','','bytes',true);
+    chartConns=createLineChart('chart-conns','rgb(34,197,94)','',false);
+}
+function populateCharts(h){
+    const l=h.map(m=>fmtTime(m.ts));
+    chartCpu.data.labels=l;chartCpu.data.datasets[0].data=h.map(m=>m.cpu);chartCpu.update('none');
+    chartMem.data.labels=l;chartMem.data.datasets[0].data=h.map(m=>m.mem);chartMem.update('none');
+    chartNet.data.labels=l;chartNet.data.datasets[0].data=h.map(m=>m.tx);chartNet.data.datasets[1].data=h.map(m=>m.rx);chartNet.update('none');
+    chartConns.data.labels=l;chartConns.data.datasets[0].data=h.map(m=>m.conns);chartConns.update('none');
+}
+async function loadHistory(){try{const r=await fetch('/api/history?range='+currentRange);populateCharts(await r.json())}catch(e){}}
+async function loadSystem(){
+    try{
+        const r=await fetch('/api/system'),d=await r.json();
+        const now=Date.now()/1000;let txR=0,rxR=0;
+        if(prevNetTs){const dt=now-prevNetTs;txR=Math.max(0,(d.net_tx-prevNetTx)/dt);rxR=Math.max(0,(d.net_rx-prevNetRx)/dt)}
+        prevNetTx=d.net_tx;prevNetRx=d.net_rx;prevNetTs=now;
+        document.getElementById('status-bar').textContent='';
+        const sb=document.getElementById('status-bar');
+        sb.insertAdjacentHTML('beforeend',
+            '<div class="status-item"><div class="status-dot" style="background:'+(d.xray?'var(--green)':'var(--red)')+'"></div><div><div class="status-label">Xray</div><div class="status-value">'+(d.xray?'Active':'Down')+'</div></div></div>'+
+            '<div class="status-item"><div><div class="status-label">Uptime</div><div class="status-value">'+fmtU(d.uptime)+'</div></div></div>'+
+            '<div class="status-item"><div><div class="status-label">Подключения</div><div class="status-value" style="color:var(--green)">'+d.connections+'</div></div></div>'+
+            '<div class="status-item"><div><div class="status-label">CPU / RAM</div><div class="status-value"><span style="color:var(--blue)">'+d.cpu+'%</span> <span style="color:var(--text2)">/</span> <span style="color:var(--purple)">'+d.mem_pct+'%</span></div></div></div>');
+        document.getElementById('live-cpu').textContent=d.cpu+'%';
+        document.getElementById('live-mem').textContent=d.mem_pct+'%';
+        document.getElementById('live-net').textContent='';
+        document.getElementById('live-net').insertAdjacentHTML('beforeend','<span style="color:var(--purple)">'+fmtB(txR)+'/s</span> <span style="color:var(--text2)">/</span> <span style="color:var(--blue)">'+fmtB(rxR)+'/s</span>');
+        document.getElementById('live-conns').textContent=d.connections;
+        const dp=d.disk_pct,dc=dp>90?'var(--red)':dp>70?'var(--amber)':'var(--blue)';
+        document.getElementById('disk-stats').textContent='';
+        document.getElementById('disk-stats').insertAdjacentHTML('beforeend',
+            '<div class="stat-card"><div class="stat-label">Использовано</div><div class="stat-value">'+fmtB(d.disk_used)+'</div><div class="stat-sub">из '+fmtB(d.disk_total)+'</div><div class="pbar"><div class="pbar-fill" style="width:'+dp+'%;background:'+dc+'"></div></div></div>'+
+            '<div class="stat-card"><div class="stat-label">Сеть (всего)</div><div class="stat-value purple">'+fmtB(d.net_tx)+'</div><div class="stat-sub">TX: '+d.net_pkt_tx.toLocaleString()+' пакетов</div></div>');
+    }catch(e){}
+}
+async function loadTrafficChart(){
+    try{const r=await fetch('/api/clients');const cl=await r.json();if(!cl.length)return;
+    if(chartTraffic)chartTraffic.destroy();
+    chartTraffic=new Chart(document.getElementById('chart-traffic'),{type:'bar',
+        data:{labels:cl.map(c=>c.name),datasets:[{label:'Upload',data:cl.map(c=>c.up),backgroundColor:'rgba(168,85,247,0.7)',borderRadius:4},{label:'Download',data:cl.map(c=>c.down),backgroundColor:'rgba(59,130,246,0.7)',borderRadius:4}]},
+        options:{responsive:true,maintainAspectRatio:true,aspectRatio:3,indexAxis:'y',
+            scales:{x:{grid:{color:'rgba(71,85,105,0.15)'},ticks:{callback:v=>fmtB(v)}},y:{grid:{display:false}}},
+            plugins:{legend:{labels:{boxWidth:10,padding:8}},tooltip:{...ttStyle,callbacks:{label:i=>i.dataset.label+': '+fmtB(i.raw)}}}}});
+    }catch(e){}
+}
+async function loadNetflowCharts(){
+    try{const r=await fetch('/api/netflow/stats');const d=await r.json();
+    if(chartNfHourly)chartNfHourly.destroy();
+    chartNfHourly=new Chart(document.getElementById('chart-nf-hourly'),{type:'bar',
+        data:{labels:d.hourly.map(h=>h.hour.slice(-5)),datasets:[{data:d.hourly.map(h=>h.count),backgroundColor:'rgba(59,130,246,0.6)',borderRadius:4}]},
+        options:{responsive:true,maintainAspectRatio:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:'rgba(71,85,105,0.15)'},ticks:{maxTicksLimit:5}}},plugins:{legend:{display:false},tooltip:ttStyle}}});
+    if(chartNfProto)chartNfProto.destroy();
+    const pl=Object.keys(d.protocols),pd=Object.values(d.protocols),pc=['rgba(59,130,246,0.8)','rgba(168,85,247,0.8)','rgba(34,197,94,0.8)','rgba(245,158,11,0.8)'];
+    chartNfProto=new Chart(document.getElementById('chart-nf-proto'),{type:'doughnut',
+        data:{labels:pl,datasets:[{data:pd,backgroundColor:pc.slice(0,pl.length),borderWidth:0}]},
+        options:{responsive:true,maintainAspectRatio:false,cutout:'65%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:6}},tooltip:ttStyle}}});
+    if(chartNfDests)chartNfDests.destroy();
+    chartNfDests=new Chart(document.getElementById('chart-nf-dests'),{type:'bar',
+        data:{labels:d.top_destinations.map(x=>x.host),datasets:[{data:d.top_destinations.map(x=>x.count),backgroundColor:'rgba(34,197,94,0.6)',borderRadius:4}]},
+        options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',scales:{x:{grid:{color:'rgba(71,85,105,0.15)'},ticks:{maxTicksLimit:5}},y:{grid:{display:false},ticks:{font:{family:'SFMono-Regular,Consolas,monospace',size:10}}}},plugins:{legend:{display:false},tooltip:ttStyle}}});
+    }catch(e){}
+}
+async function loadNetflow(){loadNetflowCharts();try{const r=await fetch('/api/netflow');netflowData=await r.json();renderNF(netflowData)}catch(e){}}
+function renderNF(data){const tb=document.getElementById('nf-table');if(!data.length){tb.textContent='';const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=6;td.style.cssText='text-align:center;color:var(--text2);padding:32px';td.textContent='Нет записей';tr.appendChild(td);tb.appendChild(tr);return}tb.textContent='';data.slice(0,200).forEach(function(e){const tr=document.createElement('tr');tr.insertAdjacentHTML('beforeend','<td class="mono" style="white-space:nowrap">'+esc(e.time)+'</td><td class="mono">'+esc(e.source)+'</td><td><span class="badge '+(e.status==='accepted'?'badge-green':'badge-red')+'">'+esc(e.status)+'</span></td><td class="mono">'+esc(e.dest)+'</td><td style="color:var(--text2);font-size:12px">'+esc(e.route||'')+'</td><td class="mono">'+esc(e.email)+'</td>');tb.appendChild(tr)})}
+function filterNetflow(){const q=document.getElementById('nf-search').value.toLowerCase();if(!q){renderNF(netflowData);return}renderNF(netflowData.filter(e=>e.source.toLowerCase().includes(q)||e.dest.toLowerCase().includes(q)||e.email.toLowerCase().includes(q)||(e.route||'').toLowerCase().includes(q)))}
+async function loadClients(){try{const r=await fetch('/api/clients');currentClients=await r.json();const el=document.getElementById('clients-list');if(!currentClients.length){el.textContent='Нет клиентов';el.style.cssText='text-align:center;color:var(--text2);padding:32px';return}el.style.cssText='';el.textContent='';currentClients.forEach(function(c){el.insertAdjacentHTML('beforeend','<div class="client-card"><div class="client-header"><div><div class="client-name">'+esc(c.name)+'</div><div class="client-email">'+esc(c.email)+'</div></div><span class="badge badge-green" style="font-size:10px">'+esc(c.created)+'</span></div><div class="client-stats"><div><div class="client-stat-label">Upload</div><div class="client-stat-val" style="color:var(--purple)">'+fmtB(c.up)+'</div></div><div><div class="client-stat-label">Download</div><div class="client-stat-val" style="color:var(--blue)">'+fmtB(c.down)+'</div></div><div><div class="client-stat-label">Всего</div><div class="client-stat-val">'+fmtB(c.up+c.down)+'</div></div></div><div class="client-actions"><button class="btn btn-sm btn-ghost" style="flex:1" onclick="showDetail(\''+c.id+'\')">Конфиг / QR</button><button class="btn btn-sm btn-red" onclick="delClient(\''+c.id+'\',\''+esc(c.name)+'\')">Удалить</button></div></div>')})}catch(e){}}
 function showAddClient(){document.getElementById('new-name').value='';document.getElementById('modal-add').classList.add('show');document.getElementById('new-name').focus()}
 async function addClient(){const n=document.getElementById('new-name').value.trim();if(!n)return;try{const r=await fetch('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}),d=await r.json();if(d.error){alert(d.error);return}closeModal('modal-add');await loadClients();showDetailData(d.id,d.name,d.link)}catch(e){alert('Error: '+e)}}
 async function delClient(id,n){if(!confirm('Удалить "'+n+'"?'))return;try{await fetch('/api/clients/'+id,{method:'DELETE'});loadClients()}catch(e){alert('Error: '+e)}}
 function showDetail(id){const c=currentClients.find(x=>x.id===id);if(c)showDetailData(c.id,c.name,c.link)}
-async function showDetailData(id,name,link){document.getElementById('detail-title').textContent=name;document.getElementById('detail-link-text').textContent=link;try{const r=await fetch('/api/clients/'+id+'/qr');document.getElementById('detail-qr').innerHTML=await r.text()}catch(e){document.getElementById('detail-qr').textContent='QR unavailable'}const url=new URL(link.replace('vless://','https://')),uid=link.split('://')[1].split('@')[0];const ps=[['Protocol','VLESS'],['Address',url.hostname],['Port',url.port],['UUID',uid],['Flow',url.searchParams.get('flow')],['Security',url.searchParams.get('security')],['SNI',url.searchParams.get('sni')],['Fingerprint',url.searchParams.get('fp')],['Public Key',url.searchParams.get('pbk')],['Short ID',url.searchParams.get('sid')],['Transport',url.searchParams.get('type')]];document.getElementById('detail-params').innerHTML=ps.map(function(p){return'<tr><td style="padding:4px 12px 4px 0;color:var(--text2)">'+p[0]+'</td><td class="mono">'+p[1]+'</td></tr>'}).join('');document.getElementById('modal-detail').classList.add('show')}
+async function showDetailData(id,name,link){document.getElementById('detail-title').textContent=name;document.getElementById('detail-link-text').textContent=link;try{const r=await fetch('/api/clients/'+id+'/qr');document.getElementById('detail-qr').textContent='';document.getElementById('detail-qr').insertAdjacentHTML('beforeend',await r.text())}catch(e){document.getElementById('detail-qr').textContent='QR unavailable'}const url=new URL(link.replace('vless://','https://')),uid=link.split('://')[1].split('@')[0];const ps=[['Protocol','VLESS'],['Address',url.hostname],['Port',url.port],['UUID',uid],['Flow',url.searchParams.get('flow')],['Security',url.searchParams.get('security')],['SNI',url.searchParams.get('sni')],['Fingerprint',url.searchParams.get('fp')],['Public Key',url.searchParams.get('pbk')],['Short ID',url.searchParams.get('sid')],['Transport',url.searchParams.get('type')]];const pt=document.getElementById('detail-params');pt.textContent='';ps.forEach(function(p){pt.insertAdjacentHTML('beforeend','<tr><td style="padding:4px 12px 4px 0;color:var(--text2)">'+p[0]+'</td><td class="mono">'+p[1]+'</td></tr>')});document.getElementById('modal-detail').classList.add('show')}
 function copyLink(){const t=document.getElementById('detail-link-text').textContent;navigator.clipboard.writeText(t).then(()=>{const b=document.querySelector('#detail-link .copy-btn');b.textContent='Скопировано!';setTimeout(()=>b.textContent='Копировать',1500)})}
-async function loadNetflow(){try{const r=await fetch('/api/netflow');netflowData=await r.json();renderNF(netflowData)}catch(e){}}
-function renderNF(data){const tb=document.getElementById('nf-table');if(!data.length){tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--text2);padding:32px">Нет записей</td></tr>';return}tb.innerHTML=data.slice(0,200).map(e=>'<tr><td class="mono" style="white-space:nowrap">'+esc(e.time)+'</td><td class="mono">'+esc(e.source)+'</td><td><span class="badge '+(e.status==='accepted'?'badge-green':'badge-red')+'">'+esc(e.status)+'</span></td><td class="mono">'+esc(e.dest)+'</td><td style="color:var(--text2);font-size:12px">'+esc(e.route||'')+'</td><td class="mono">'+esc(e.email)+'</td></tr>').join('')}
-function filterNetflow(){const q=document.getElementById('nf-search').value.toLowerCase();if(!q){renderNF(netflowData);return}renderNF(netflowData.filter(e=>e.source.toLowerCase().includes(q)||e.dest.toLowerCase().includes(q)||e.email.toLowerCase().includes(q)||(e.route||'').toLowerCase().includes(q)))}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 document.querySelectorAll('.modal-overlay').forEach(m=>{m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('show')})});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.modal-overlay.show').forEach(m=>m.classList.remove('show'))});
 document.getElementById('new-name').addEventListener('keydown',e=>{if(e.key==='Enter')addClient()});
+document.querySelectorAll('nav button').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.tab).classList.add('active');if(b.dataset.tab==='clients')loadClients();if(b.dataset.tab==='netflow')loadNetflow();if(b.dataset.tab==='overview'){loadHistory();loadTrafficChart()}})});
+document.querySelectorAll('.range-btn').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('.range-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentRange=b.dataset.r;loadHistory()})});
 async function restartXray(){if(!confirm('Перезапустить Xray?'))return;try{const r=await fetch('/api/xray/restart',{method:'POST'}),d=await r.json();alert(d.ok?'Xray перезапущен':'Ошибка');loadSystem()}catch(e){alert('Error: '+e)}}
-loadSystem();setInterval(loadSystem,5000);
+initCharts();loadSystem();loadHistory();loadTrafficChart();setInterval(loadSystem,5000);setInterval(loadHistory,30000);
 </script></body></html>
 HTMLEOF
 echo "[+] Dashboard HTML written"
@@ -587,7 +791,8 @@ ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
 echo "[+] Whitelist firewall configured"
 
 # ── 16. File permissions ────────────────────────────────
-chmod 600 /usr/local/etc/xray/config.json
+chown root:nogroup /usr/local/etc/xray/config.json
+chmod 640 /usr/local/etc/xray/config.json
 chmod 600 /opt/vpn-dashboard/clients.json
 
 # ── 17. Start services ──────────────────────────────────

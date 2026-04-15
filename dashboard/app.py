@@ -8,6 +8,7 @@ import uuid
 import time
 import re
 import threading
+from collections import deque
 from datetime import datetime
 
 from flask import Flask, render_template, jsonify, request, Response
@@ -44,6 +45,7 @@ def security_headers(response):
 XRAY_CONFIG = '/usr/local/etc/xray/config.json'
 CLIENTS_DB = '/opt/vpn-dashboard/clients.json'
 ACCESS_LOG = '/var/log/xray/access.log'
+METRICS_FILE = '/opt/vpn-dashboard/metrics_history.json'
 
 SERVER_IP = '151.242.88.11'
 SERVER_PORT = 443
@@ -52,6 +54,61 @@ REALITY_FP = 'chrome'
 REALITY_PBK = 'V7bqii4d6xy8SvY3DUuozndXU74douLlYI3YGvloXzE'
 REALITY_SID = 'b70c4f452946aa6a'
 XRAY_API = '127.0.0.1:10085'
+NET_IFACE = 'ens1'
+
+# ── Metrics History ─────────────────────────────────────
+
+metrics_history = deque(maxlen=2880)  # 24h @ 30s intervals
+_prev_net = {'tx': 0, 'rx': 0, 'ts': 0}
+
+
+def metrics_collector():
+    global _prev_net
+    if os.path.exists(METRICS_FILE):
+        try:
+            with open(METRICS_FILE) as f:
+                for item in json.load(f):
+                    metrics_history.append(item)
+        except Exception:
+            pass
+    save_counter = 0
+    while True:
+        try:
+            cpu = psutil.cpu_percent(interval=1)
+            mem = psutil.virtual_memory()
+            net = psutil.net_io_counters(pernic=True)
+            ens = net.get(NET_IFACE, psutil.net_io_counters())
+            now = time.time()
+            dt = now - _prev_net['ts'] if _prev_net['ts'] else 30
+            tx_rate = max(0, (ens.bytes_sent - _prev_net['tx']) / dt) if _prev_net['tx'] else 0
+            rx_rate = max(0, (ens.bytes_recv - _prev_net['rx']) / dt) if _prev_net['rx'] else 0
+            _prev_net = {'tx': ens.bytes_sent, 'rx': ens.bytes_recv, 'ts': now}
+            conns = 0
+            try:
+                for c in psutil.net_connections('tcp'):
+                    if c.laddr and c.laddr.port == 443 and c.status == 'ESTABLISHED':
+                        conns += 1
+            except Exception:
+                pass
+            metrics_history.append({
+                'ts': int(now),
+                'cpu': cpu,
+                'mem': mem.percent,
+                'tx': int(tx_rate),
+                'rx': int(rx_rate),
+                'conns': conns,
+            })
+            save_counter += 1
+            if save_counter >= 10:
+                save_counter = 0
+                try:
+                    with open(METRICS_FILE, 'w') as f:
+                        json.dump(list(metrics_history), f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(30)
 
 
 # ── Helpers ──────────────────────────────────────────────
@@ -75,7 +132,6 @@ def restart_xray():
 
 
 def restart_xray_bg():
-    """Restart Xray after a delay so the HTTP response gets sent first."""
     def _restart():
         time.sleep(1.5)
         subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
@@ -148,7 +204,6 @@ def parse_access_log(limit=500):
         for line in reversed(r.stdout.strip().split('\n')):
             if not line.strip():
                 continue
-            # Format: 2026/04/14 15:22:00.376429 from tcp:94.25.229.219:11544 accepted udp:1.1.1.1:53 [vless-reality >> direct] email: default@vpn
             m = re.match(
                 r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\S*\s+'
                 r'from\s+(?:\w+:)?([\d.]+:\d+)\s+'
@@ -187,14 +242,13 @@ def api_system():
     disk = psutil.disk_usage('/')
     uptime = int(time.time() - psutil.boot_time())
     net = psutil.net_io_counters(pernic=True)
-    ens = net.get('ens1', psutil.net_io_counters())
+    ens = net.get(NET_IFACE, psutil.net_io_counters())
 
     xray_active = subprocess.run(
         ['systemctl', 'is-active', 'xray'],
         capture_output=True, text=True
     ).stdout.strip() == 'active'
 
-    # Connection count
     conns = 0
     try:
         for c in psutil.net_connections('tcp'):
@@ -219,6 +273,39 @@ def api_system():
         'net_pkt_rx': ens.packets_recv,
         'xray': xray_active,
         'connections': conns,
+    })
+
+
+@app.route('/api/history')
+def api_history():
+    r = request.args.get('range', '1h')
+    cutoff = time.time() - {'1h': 3600, '6h': 21600, '24h': 86400}.get(r, 3600)
+    return jsonify([m for m in metrics_history if m['ts'] >= cutoff])
+
+
+@app.route('/api/netflow/stats')
+def api_netflow_stats():
+    entries = parse_access_log(500)
+    hourly = {}
+    for e in entries:
+        hour = e['time'][:13]
+        hourly[hour] = hourly.get(hour, 0) + 1
+    protos = {}
+    for e in entries:
+        protos[e['proto']] = protos.get(e['proto'], 0) + 1
+    dests = {}
+    for e in entries:
+        host = e['dest'].rsplit(':', 1)[0]
+        dests[host] = dests.get(host, 0) + 1
+    top_dests = sorted(dests.items(), key=lambda x: -x[1])[:10]
+    clients = {}
+    for e in entries:
+        clients[e['email']] = clients.get(e['email'], 0) + 1
+    return jsonify({
+        'hourly': [{'hour': k, 'count': v} for k, v in sorted(hourly.items())],
+        'protocols': protos,
+        'top_destinations': [{'host': h, 'count': c} for h, c in top_dests],
+        'per_client': [{'email': k, 'count': v} for k, v in sorted(clients.items(), key=lambda x: -x[1])],
     })
 
 
@@ -347,4 +434,5 @@ def api_restart_xray():
 if __name__ == '__main__':
     if not os.path.exists(CLIENTS_DB):
         save_json(CLIENTS_DB, {})
+    threading.Thread(target=metrics_collector, daemon=True).start()
     app.run(host='0.0.0.0', port=8080, debug=False)

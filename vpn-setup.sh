@@ -82,10 +82,30 @@ SYSCTL
 sysctl -p > /dev/null 2>&1
 echo "[+] BBR enabled, buffers optimized"
 
+# ── 6b. DNS-over-TLS (system-level) ─────────────────────
+echo "[*] Configuring DNS-over-TLS..."
+cat > /etc/systemd/resolved.conf << 'DNSEOF'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google
+FallbackDNS=1.0.0.1#cloudflare-dns.com 8.8.4.4#dns.google
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+Cache=yes
+DNSEOF
+systemctl restart systemd-resolved 2>/dev/null || true
+echo "[+] System DNS-over-TLS configured"
+
 # ── 7. Xray config ──────────────────────────────────────
 echo "[*] Writing Xray config..."
 cat > /usr/local/etc/xray/config.json << XRAYEOF
 {
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      "https://8.8.8.8/dns-query"
+    ],
+    "queryStrategy": "UseIPv4"
+  },
   "log": {
     "loglevel": "warning",
     "access": "/var/log/xray/access.log"
@@ -148,25 +168,42 @@ cat > /usr/local/etc/xray/config.json << XRAYEOF
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "destOverride": ["http", "tls", "quic", "fakedns"]
       }
     }
   ],
   "outbounds": [
-    {"protocol": "freedom", "tag": "direct"},
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    },
     {"protocol": "blackhole", "tag": "block"}
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["api"],
         "outboundTag": "api"
+      },
+      {
+        "type": "field",
+        "protocol": ["dns"],
+        "outboundTag": "dns-out"
       }
     ]
   }
 }
 XRAYEOF
+chmod 644 /usr/local/etc/xray/config.json
 echo "[+] Xray config written"
 
 # ── 8. Dashboard app.py ─────────────────────────────────
@@ -827,6 +864,13 @@ echo "  -- QR Code (scan in v2rayNG) --"
 echo ""
 qrencode -t ansiutf8 "$VLESS_LINK"
 echo ""
+echo "  -- DNS Leak Protection --"
+echo ""
+echo "  Server: DoH (Cloudflare + Google) via Xray"
+echo "  System: DNS-over-TLS via systemd-resolved"
+echo "  Client: Set Remote DNS = https://1.1.1.1/dns-query"
+echo "  Verify: https://dnsleaktest.com"
+echo ""
 
 cat > /opt/vpn-credentials.txt << CREDEOF
 VPN Server Credentials — Generated: ${NOW}
@@ -842,6 +886,29 @@ VLESS Link:
 ${VLESS_LINK}
 
 Dashboard: http://${SERVER_IP}:8080 (via VPN only)
+
+--- DNS Leak Protection (client setup) ---
+
+Server DNS: DoH (Cloudflare + Google) — already configured.
+To prevent DNS leaks on your device, configure your VPN client:
+
+v2rayN (Windows):
+  Settings > DNS > Remote DNS = https://1.1.1.1/dns-query
+  Enable "Sniffing" in the server settings
+
+v2rayNG (Android):
+  Settings > Routing > DNS = https://1.1.1.1/dns-query
+  Enable "Sniffing" + "FakeDNS"
+
+Streisand / FoXray (iOS):
+  Settings > DNS > Remote DNS = https://1.1.1.1/dns-query
+
+Nekobox / sing-box:
+  DNS > Remote = https://1.1.1.1/dns-query
+  DNS > Strategy = prefer_ipv4
+  Enable "Sniffing"
+
+Verify: https://dnsleaktest.com (while connected to VPN)
 CREDEOF
 chmod 600 /opt/vpn-credentials.txt
 echo "  Credentials saved to /opt/vpn-credentials.txt"

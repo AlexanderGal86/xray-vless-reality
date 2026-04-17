@@ -96,7 +96,8 @@ dashboard/
 | Firewall | Whitelist: INPUT DROP, only 22/443/68 allowed |
 | Fail2ban | 5 retries, 1h ban escalating to 1 week |
 | SSH | No root login, no X11, max 3 tries per connection |
-| Xray config | Mode 600 (root only) |
+| DNS | DoH (Xray) + DoT (system) — no plaintext DNS queries |
+| Xray config | Mode 644 (nobody-readable) |
 | Dashboard | VPN-only access, rate limited, security headers |
 | Log rotation | Daily, 7 days retention, copytruncate |
 
@@ -109,6 +110,69 @@ dashboard/
 | Windows | [v2rayN](https://github.com/2dust/v2rayN/releases) |
 | macOS | [V2BOX](https://apps.apple.com/app/v2box-v2ray-client/id6446814690) |
 | Linux | [v2rayA](https://github.com/v2rayA/v2rayA) |
+
+## DNS Leak Protection
+
+The server is preconfigured with multi-layer DNS protection:
+
+| Layer | Method |
+|-------|--------|
+| Xray DNS module | DNS-over-HTTPS (Cloudflare 1.1.1.1 + Google 8.8.8.8) |
+| Xray sniffing | `fakedns` + TLS/HTTP/QUIC — detects real domains from traffic |
+| Xray freedom outbound | `domainStrategy: UseIPv4` — resolves via Xray DNS, not system |
+| System DNS | DNS-over-TLS via systemd-resolved |
+
+### Client Setup
+
+The server handles DNS securely, but the client app must also be configured to prevent leaks before traffic enters the tunnel.
+
+<details>
+<summary><b>v2rayN (Windows)</b></summary>
+
+1. Open **Settings → DNS**
+2. Set **Remote DNS** to `https://1.1.1.1/dns-query`
+3. Go to your server settings → enable **Sniffing**
+
+</details>
+
+<details>
+<summary><b>v2rayNG (Android)</b></summary>
+
+1. Open **Settings → Routing Settings**
+2. Set **Remote DNS** to `https://1.1.1.1/dns-query`
+3. Enable **Sniffing** and **FakeDNS**
+
+</details>
+
+<details>
+<summary><b>Streisand / FoXray (iOS)</b></summary>
+
+1. Open **Settings → DNS**
+2. Set **Remote DNS** to `https://1.1.1.1/dns-query`
+
+</details>
+
+<details>
+<summary><b>Nekobox / sing-box (Android)</b></summary>
+
+1. Open **DNS Settings**
+2. Set **Remote** to `https://1.1.1.1/dns-query`
+3. Set **DNS Strategy** to `prefer_ipv4`
+4. Enable **Sniffing**
+
+</details>
+
+<details>
+<summary><b>V2BOX (macOS)</b></summary>
+
+1. Open **Settings → DNS**
+2. Set **Remote DNS** to `https://1.1.1.1/dns-query`
+
+</details>
+
+### Verify
+
+After connecting, open [dnsleaktest.com](https://dnsleaktest.com) and run the **Extended test**. You should see only Cloudflare or Google DNS servers — not your ISP.
 
 ## License
 

@@ -76,17 +76,15 @@ Credentials are saved to `/opt/vpn-credentials.txt` (mode 600).
 
 </details>
 
-The dashboard source is in `dashboard/` for reference. The setup script embeds it automatically — no separate install needed.
+The dashboard (`app.py` + HTML + Chart.js) is embedded as heredocs inside `vpn-setup.sh` — no separate install needed.
 
 ## File Structure
 
 ```
-vpn-setup.sh          # Self-contained setup script (~640 lines)
-cloud-init.yml        # Cloud-init config with embedded script
-dashboard/
-  app.py              # Flask backend (reference copy)
-  templates/
-    index.html        # Dashboard UI (reference copy)
+vpn-setup.sh     # Self-contained setup script — the only artifact
+cloud-init.yml   # Auto-generated from vpn-setup.sh (do not hand-edit)
+README.md
+CLAUDE.md        # Project context for AI-assisted editing
 ```
 
 ## Security Features

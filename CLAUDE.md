@@ -19,7 +19,7 @@ The dashboard binds to `0.0.0.0:8080` but iptables blocks port 8080 on the publi
 ## Files
 
 ### `vpn-setup.sh`
-The main artifact. Self-contained bash script (~640 lines) that embeds all configs as heredocs:
+The main artifact. Self-contained bash script (~860 lines) that embeds all configs as heredocs:
 - Xray config (JSON with shell variable interpolation via `${VAR}`)
 - Flask app.py (written with `'APPEOF'` quoted heredoc to prevent expansion, then `sed` replaces `__PLACEHOLDER__` values)
 - HTML template (quoted heredoc, no substitution)
@@ -50,31 +50,38 @@ with open('cloud-init.yml','w') as f:
 "
 ```
 
-### `dashboard/app.py`
-Flask app. Reference copy — the setup script embeds its own version. Key constants at top (`SERVER_IP`, `REALITY_PBK`, etc.) are injected by the setup script.
+### Dashboard (embedded inside `vpn-setup.sh`)
+
+The Flask app and HTML template are **only** inside `vpn-setup.sh` heredocs — there is no separate `dashboard/` directory. Single source of truth.
+
+- **app.py heredoc** — starts at `cat > /opt/vpn-dashboard/app.py << 'APPEOF'` (search `APPEOF`). Quoted heredoc (no shell expansion); `sed` replaces `__SERVER_IP__`, `__REALITY_PBK__`, `__REALITY_SID__`, `__NET_IFACE__` after write.
+- **index.html heredoc** — starts at `cat > /opt/vpn-dashboard/templates/index.html << 'HTMLEOF'` (search `HTMLEOF`). Quoted, no substitution.
+- **Chart.js** — downloaded to `/opt/vpn-dashboard/static/chart.min.js` during install (not embedded).
 
 **Routes:**
 - `GET /` — serves index.html
 - `GET /api/system` — CPU, RAM, disk, network, Xray status
+- `GET /api/history?range=1h|6h|24h` — time-series metrics from background collector
 - `GET /api/clients` — list clients with traffic stats from Xray Stats API
 - `POST /api/clients` — add client (writes to xray config + clients.json, restarts Xray)
 - `DELETE /api/clients/<id>` — remove client
 - `GET /api/clients/<id>/qr` — QR code as SVG
 - `GET /api/netflow` — parsed access log (last 500 lines)
+- `GET /api/netflow/stats` — aggregated netflow (hourly, protocols, top destinations, per-client)
 - `POST /api/xray/restart` — restart Xray service
 
 **Important pattern — `restart_xray_bg()`**: Xray restart is delayed 1.5s in a thread so the HTTP response reaches the client first. This matters because the VPN tunnel carries the HTTP request — restarting Xray immediately would kill the connection before the response is sent.
 
-### `dashboard/templates/index.html`
-Single-page app, dark theme, Russian UI. All JS/CSS inline (no external dependencies). Uses `esc()` for XSS-safe DOM rendering. Polls `/api/system` every 5 seconds.
+**Metrics collector thread**: `metrics_collector()` samples CPU/RAM/net/conns every 30s into `deque(maxlen=2880)` (24h history), persists to `metrics_history.json` every 5min. Started as daemon thread before `app.run()`.
 
 ## Common Tasks
 
 ### Adding a new API endpoint
-1. Add route in `dashboard/app.py`
-2. Add the same route in the embedded app.py heredoc inside `vpn-setup.sh` (search for `APPEOF`)
+1. Edit the embedded app.py heredoc inside `vpn-setup.sh` (search for `APPEOF`)
+2. If UI needed, edit the embedded HTML heredoc (search `HTMLEOF`)
 3. Add rate limiting decorator if the endpoint mutates state
 4. Regenerate `cloud-init.yml`
+5. For testing, also update the live `/opt/vpn-dashboard/app.py` on the dev server and `systemctl restart vpn-dashboard`
 
 ### Changing firewall rules
 Rules are in section `# ── 15. Firewall` of `vpn-setup.sh`. Current whitelist:
@@ -103,4 +110,6 @@ cat /opt/vpn-credentials.txt       # VLESS link for client
 - **REALITY key format**: `xray x25519` output labels vary between versions — the grep for `PrivateKey` and `Password` (not `PublicKey`) matches the current Xray output format
 - **Xray has no log-reopen signal**: That's why logrotate uses `copytruncate` instead of the usual rename+SIGHUP pattern
 - **cloud-init.yml must be regenerated, not hand-edited**: YAML escaping of the bash script is non-trivial (quotes, backslashes, dollar signs)
-- **NET_IFACE is not always `ens1`**: The script auto-detects it, but the reference `dashboard/app.py` has it hardcoded — only the deployed version matters
+- **NET_IFACE is not always `ens1`**: The script auto-detects it and injects via `sed` (`__NET_IFACE__` placeholder)
+- **Xray config mode 644, not 600**: Xray runs as `nobody` (see `User=nobody` in systemd unit); config needs world-readable permissions
+- **DNS leak protection**: Xray has a DNS module using DoH (Cloudflare + Google); `freedom` outbound uses `domainStrategy: UseIPv4` so domains resolve via Xray's DNS (not system). systemd-resolved is also configured with DoT. See section `6b` in `vpn-setup.sh`

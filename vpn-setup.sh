@@ -386,10 +386,6 @@ def api_history():
 @app.route('/api/netflow/stats')
 def api_netflow_stats():
     entries = parse_access_log(500)
-    hourly = {}
-    for e in entries:
-        hour = e['time'][:13]
-        hourly[hour] = hourly.get(hour, 0) + 1
     protos = {}
     for e in entries:
         protos[e['proto']] = protos.get(e['proto'], 0) + 1
@@ -398,13 +394,18 @@ def api_netflow_stats():
         host = e['dest'].rsplit(':', 1)[0]
         dests[host] = dests.get(host, 0) + 1
     top_dests = sorted(dests.items(), key=lambda x: -x[1])[:10]
+    sources = {}
+    for e in entries:
+        ip = e['source'].rsplit(':', 1)[0]
+        sources[ip] = sources.get(ip, 0) + 1
+    top_sources = sorted(sources.items(), key=lambda x: -x[1])[:10]
     clients = {}
     for e in entries:
         clients[e['email']] = clients.get(e['email'], 0) + 1
     return jsonify({
-        'hourly': [{'hour': k, 'count': v} for k, v in sorted(hourly.items())],
         'protocols': protos,
         'top_destinations': [{'host': h, 'count': c} for h, c in top_dests],
+        'top_sources': [{'ip': ip, 'count': c} for ip, c in top_sources],
         'per_client': [{'email': k, 'count': v} for k, v in sorted(clients.items(), key=lambda x: -x[1])]})
 
 @app.route('/api/clients')
@@ -598,7 +599,7 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 <section id="netflow">
 <div class="toolbar"><h2>Netflow / Access Log</h2><button class="btn btn-sm btn-ghost" onclick="loadNetflow()">Обновить</button></div>
 <div class="nf-charts">
-<div class="nf-chart-card"><div class="chart-title">Подключения по часам</div><div class="nf-chart-wrap"><canvas id="chart-nf-hourly"></canvas></div></div>
+<div class="nf-chart-card"><div class="chart-title">Топ источников</div><div class="nf-chart-wrap"><canvas id="chart-nf-sources"></canvas></div></div>
 <div class="nf-chart-card"><div class="chart-title">Протоколы</div><div class="doughnut-wrap"><canvas id="chart-nf-proto"></canvas></div></div>
 <div class="nf-chart-card"><div class="chart-title">Топ направления</div><div class="nf-chart-wrap"><canvas id="chart-nf-dests"></canvas></div></div>
 </div>
@@ -613,7 +614,7 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 /* NOTE: All user-supplied data is escaped via esc() before DOM insertion */
 let netflowData=[],currentClients=[],currentRange='1h';
 let chartCpu,chartMem,chartNet,chartConns,chartTraffic;
-let chartNfHourly,chartNfProto,chartNfDests;
+let chartNfSources,chartNfProto,chartNfDests;
 let prevNetTx=0,prevNetRx=0,prevNetTs=0;
 function fmtB(b){if(!b||b===0)return'0 B';const u=['B','KB','MB','GB','TB'],i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i]}
 function fmtU(s){const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);if(d>0)return d+'д '+h+'ч';if(h>0)return h+'ч '+m+'м';return m+'м'}
@@ -684,10 +685,10 @@ async function loadTrafficChart(){
 }
 async function loadNetflowCharts(){
     try{const r=await fetch('/api/netflow/stats');const d=await r.json();
-    if(chartNfHourly)chartNfHourly.destroy();
-    chartNfHourly=new Chart(document.getElementById('chart-nf-hourly'),{type:'bar',
-        data:{labels:d.hourly.map(h=>h.hour.slice(-5)),datasets:[{data:d.hourly.map(h=>h.count),backgroundColor:'rgba(59,130,246,0.6)',borderRadius:4}]},
-        options:{responsive:true,maintainAspectRatio:false,scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:'rgba(71,85,105,0.15)'},ticks:{maxTicksLimit:5}}},plugins:{legend:{display:false},tooltip:ttStyle}}});
+    if(chartNfSources)chartNfSources.destroy();
+    chartNfSources=new Chart(document.getElementById('chart-nf-sources'),{type:'bar',
+        data:{labels:d.top_sources.map(x=>x.ip),datasets:[{data:d.top_sources.map(x=>x.count),backgroundColor:'rgba(168,85,247,0.6)',borderRadius:4}]},
+        options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',scales:{x:{grid:{color:'rgba(71,85,105,0.15)'},ticks:{maxTicksLimit:5}},y:{grid:{display:false},ticks:{font:{family:'SFMono-Regular,Consolas,monospace',size:10}}}},plugins:{legend:{display:false},tooltip:ttStyle}}});
     if(chartNfProto)chartNfProto.destroy();
     const pl=Object.keys(d.protocols),pd=Object.values(d.protocols),pc=['rgba(59,130,246,0.8)','rgba(168,85,247,0.8)','rgba(34,197,94,0.8)','rgba(245,158,11,0.8)'];
     chartNfProto=new Chart(document.getElementById('chart-nf-proto'),{type:'doughnut',

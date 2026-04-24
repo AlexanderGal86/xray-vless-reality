@@ -19,7 +19,7 @@ The dashboard binds to `0.0.0.0:8080` but iptables blocks port 8080 on the publi
 ## Files
 
 ### `vpn-setup.sh`
-The main artifact. Self-contained bash script (~860 lines) that embeds all configs as heredocs:
+The main artifact. Self-contained bash script that embeds all configs as heredocs:
 - Xray config (JSON with shell variable interpolation via `${VAR}`)
 - Flask app.py (written with `'APPEOF'` quoted heredoc to prevent expansion, then `sed` replaces `__PLACEHOLDER__` values)
 - HTML template (quoted heredoc, no substitution)
@@ -112,4 +112,5 @@ cat /opt/vpn-credentials.txt       # VLESS link for client
 - **cloud-init.yml must be regenerated, not hand-edited**: YAML escaping of the bash script is non-trivial (quotes, backslashes, dollar signs)
 - **NET_IFACE is not always `ens1`**: The script auto-detects it and injects via `sed` (`__NET_IFACE__` placeholder)
 - **Xray config mode 644, not 600**: Xray runs as `nobody` (see `User=nobody` in systemd unit); config needs world-readable permissions
-- **DNS leak protection**: Xray has a DNS module using DoH (Cloudflare + Google); `freedom` outbound uses `domainStrategy: UseIPv4` so domains resolve via Xray's DNS (not system). systemd-resolved is also configured with DoT. See section `6b` in `vpn-setup.sh`
+- **DNS leak protection** lives in two places: section `6b` configures systemd-resolved with DoT (system-level), and section `7` (Xray config heredoc) includes Xray's DoH DNS module (Cloudflare + Google) plus `domainStrategy: UseIPv4` on the `freedom` outbound so domains resolve via Xray's DNS, not the OS resolver
+- **Fail2ban uses nftables, not iptables**: Rules live in table `inet f2b-table` (inspect with `nft list table inet f2b-table`), NOT visible via `iptables -L`. The main firewall (section 15) is still iptables — two separate subsystems coexist. To override ban behavior (e.g. drop vs reject), create `/etc/fail2ban/action.d/nftables.local` with `[Init]` / `blocktype = drop` — never edit `nftables.conf` directly (package updates overwrite it)

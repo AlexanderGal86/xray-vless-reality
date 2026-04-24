@@ -789,6 +789,13 @@ port = 22
 logpath = %(sshd_log)s
 backend = systemd
 F2BEOF
+
+# Override default banaction to drop silently instead of reject+ICMP
+cat > /etc/fail2ban/action.d/nftables.local << 'F2BACTEOF'
+[Init]
+blocktype = drop
+F2BACTEOF
+
 echo "[+] Fail2ban configured"
 
 # ── 14. SSH hardening ───────────────────────────────────

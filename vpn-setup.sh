@@ -216,7 +216,7 @@ cat > /opt/vpn-dashboard/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """VPN Dashboard — Xray VLESS+REALITY management"""
 
-import json, os, subprocess, uuid, time, re, threading
+import json, os, subprocess, uuid, time, re, threading, secrets
 from collections import deque
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request, Response
@@ -311,11 +311,11 @@ def restart_xray_bg():
         subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
     threading.Thread(target=_r, daemon=True).start()
 
-def vless_link(client_uuid, name='VPN'):
+def vless_link(client_uuid, name='VPN', sid=None):
     return (f"vless://{client_uuid}@{SERVER_IP}:{SERVER_PORT}"
             f"?encryption=none&flow=xtls-rprx-vision&security=reality"
             f"&sni={REALITY_SNI}&fp={REALITY_FP}&pbk={REALITY_PBK}"
-            f"&sid={REALITY_SID}&type=tcp#{name}")
+            f"&sid={sid or REALITY_SID}&type=tcp#{name}")
 
 def qr_svg(data):
     try:
@@ -424,7 +424,9 @@ def api_clients():
                 clients.append({'id':cid,'email':email,
                     'name':meta.get('name', email.split('@')[0] if email else cid[:8]),
                     'created':meta.get('created','-'),'up':t['uplink'],'down':t['downlink'],
-                    'link':vless_link(cid, meta.get('name','VPN'))})
+                    'link':vless_link(cid, meta.get('name','VPN'), meta.get('shortId')),
+                    'sid':meta.get('shortId') or REALITY_SID,
+                    'pooled':not meta.get('shortId')})
             break
     return jsonify(clients)
 
@@ -434,34 +436,51 @@ def api_add_client():
     data = request.get_json() or {}; name = data.get('name','').strip()
     if not name: return jsonify({'error':'Name required'}), 400
     cid = str(uuid.uuid4()); email = f"{re.sub(r'[^a-z0-9]', '-', name.lower())}@vpn"
-    config = load_json(XRAY_CONFIG)
+    sid = secrets.token_hex(8)
+    config = load_json(XRAY_CONFIG); pooled = False
     for ib in config.get('inbounds',[]):
         if ib.get('protocol') == 'vless':
-            ib['settings']['clients'].append({'id':cid,'flow':'xtls-rprx-vision','email':email}); break
+            ib['settings']['clients'].append({'id':cid,'flow':'xtls-rprx-vision','email':email})
+            sids = ib.setdefault('streamSettings',{}).setdefault('realitySettings',{}).setdefault('shortIds',[])
+            if len(sids) < 8:
+                sids.append(sid)
+            else:
+                sid = REALITY_SID; pooled = True
+            break
     save_json(XRAY_CONFIG, config)
     db = load_json(CLIENTS_DB, {})
-    db[cid] = {'name':name,'email':email,'created':datetime.now().strftime('%Y-%m-%d %H:%M')}
+    db[cid] = {'name':name,'email':email,'shortId':sid,
+               'created':datetime.now().strftime('%Y-%m-%d %H:%M')}
     save_json(CLIENTS_DB, db); restart_xray_bg()
-    return jsonify({'id':cid,'name':name,'email':email,'link':vless_link(cid,name),'created':db[cid]['created']})
+    return jsonify({'id':cid,'name':name,'email':email,'shortId':sid,'pooled':pooled,
+                    'link':vless_link(cid,name,sid),'created':db[cid]['created']})
 
 @app.route('/api/clients/<cid>', methods=['DELETE'])
 @limiter.limit("10 per minute")
 def api_del_client(cid):
     config = load_json(XRAY_CONFIG); found = False
+    db = load_json(CLIENTS_DB, {}); victim_sid = db.get(cid,{}).get('shortId')
     for ib in config.get('inbounds',[]):
         if ib.get('protocol') == 'vless':
             before = len(ib['settings']['clients'])
             ib['settings']['clients'] = [c for c in ib['settings']['clients'] if c['id'] != cid]
-            found = before > len(ib['settings']['clients']); break
+            found = before > len(ib['settings']['clients'])
+            if found and victim_sid and victim_sid != REALITY_SID:
+                still_used = any(m.get('shortId') == victim_sid
+                                 for k,m in db.items() if k != cid)
+                if not still_used:
+                    sids = ib.get('streamSettings',{}).get('realitySettings',{}).get('shortIds',[])
+                    if victim_sid in sids: sids.remove(victim_sid)
+            break
     if not found: return jsonify({'error':'Not found'}), 404
     save_json(XRAY_CONFIG, config)
-    db = load_json(CLIENTS_DB, {}); db.pop(cid, None); save_json(CLIENTS_DB, db)
+    db.pop(cid, None); save_json(CLIENTS_DB, db)
     restart_xray_bg(); return jsonify({'ok':True})
 
 @app.route('/api/clients/<cid>/qr')
 def api_qr(cid):
     db = load_json(CLIENTS_DB, {}); meta = db.get(cid,{})
-    svg = qr_svg(vless_link(cid, meta.get('name','VPN')))
+    svg = qr_svg(vless_link(cid, meta.get('name','VPN'), meta.get('shortId')))
     if svg: return Response(svg, mimetype='image/svg+xml')
     return jsonify({'error':'QR failed'}), 500
 
@@ -575,6 +594,8 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 .client-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .client-name{font-weight:600;font-size:15px}
 .client-email{font-size:11px;color:var(--text2);font-family:monospace}
+.client-sid{font-size:10px;color:var(--text2);font-family:monospace;margin-top:2px}
+.client-sid .shared{color:#a78bfa;margin-left:6px;font-style:italic}
 .client-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}
 .client-stat-label{font-size:10px;color:var(--text2);text-transform:uppercase}
 .client-stat-val{font-size:13px;font-weight:600}
@@ -707,7 +728,7 @@ async function loadNetflowCharts(){
 async function loadNetflow(){loadNetflowCharts();try{const r=await fetch('/api/netflow');netflowData=await r.json();renderNF(netflowData)}catch(e){}}
 function renderNF(data){const tb=document.getElementById('nf-table');if(!data.length){tb.textContent='';const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=6;td.style.cssText='text-align:center;color:var(--text2);padding:32px';td.textContent='Нет записей';tr.appendChild(td);tb.appendChild(tr);return}tb.textContent='';data.slice(0,200).forEach(function(e){const tr=document.createElement('tr');tr.insertAdjacentHTML('beforeend','<td class="mono" style="white-space:nowrap">'+esc(e.time)+'</td><td class="mono">'+esc(e.source)+'</td><td><span class="badge '+(e.status==='accepted'?'badge-green':'badge-red')+'">'+esc(e.status)+'</span></td><td class="mono">'+esc(e.dest)+'</td><td style="color:var(--text2);font-size:12px">'+esc(e.route||'')+'</td><td class="mono">'+esc(e.email)+'</td>');tb.appendChild(tr)})}
 function filterNetflow(){const q=document.getElementById('nf-search').value.toLowerCase();if(!q){renderNF(netflowData);return}renderNF(netflowData.filter(e=>e.source.toLowerCase().includes(q)||e.dest.toLowerCase().includes(q)||e.email.toLowerCase().includes(q)||(e.route||'').toLowerCase().includes(q)))}
-async function loadClients(){try{const r=await fetch('/api/clients');currentClients=await r.json();const el=document.getElementById('clients-list');if(!currentClients.length){el.textContent='Нет клиентов';el.style.cssText='text-align:center;color:var(--text2);padding:32px';return}el.style.cssText='';el.textContent='';currentClients.forEach(function(c){el.insertAdjacentHTML('beforeend','<div class="client-card"><div class="client-header"><div><div class="client-name">'+esc(c.name)+'</div><div class="client-email">'+esc(c.email)+'</div></div><span class="badge badge-green" style="font-size:10px">'+esc(c.created)+'</span></div><div class="client-stats"><div><div class="client-stat-label">Upload</div><div class="client-stat-val" style="color:var(--purple)">'+fmtB(c.up)+'</div></div><div><div class="client-stat-label">Download</div><div class="client-stat-val" style="color:var(--blue)">'+fmtB(c.down)+'</div></div><div><div class="client-stat-label">Всего</div><div class="client-stat-val">'+fmtB(c.up+c.down)+'</div></div></div><div class="client-actions"><button class="btn btn-sm btn-ghost" style="flex:1" onclick="showDetail(\''+c.id+'\')">Конфиг / QR</button><button class="btn btn-sm btn-red" onclick="delClient(\''+c.id+'\',\''+esc(c.name)+'\')">Удалить</button></div></div>')})}catch(e){}}
+async function loadClients(){try{const r=await fetch('/api/clients');currentClients=await r.json();const el=document.getElementById('clients-list');if(!currentClients.length){el.textContent='Нет клиентов';el.style.cssText='text-align:center;color:var(--text2);padding:32px';return}el.style.cssText='';el.textContent='';currentClients.forEach(function(c){el.insertAdjacentHTML('beforeend','<div class="client-card"><div class="client-header"><div><div class="client-name">'+esc(c.name)+'</div><div class="client-email">'+esc(c.email)+'</div><div class="client-sid">sid: '+esc(c.sid||'')+(c.pooled?'<span class="shared">общий</span>':'')+'</div></div><span class="badge badge-green" style="font-size:10px">'+esc(c.created)+'</span></div><div class="client-stats"><div><div class="client-stat-label">Upload</div><div class="client-stat-val" style="color:var(--purple)">'+fmtB(c.up)+'</div></div><div><div class="client-stat-label">Download</div><div class="client-stat-val" style="color:var(--blue)">'+fmtB(c.down)+'</div></div><div><div class="client-stat-label">Всего</div><div class="client-stat-val">'+fmtB(c.up+c.down)+'</div></div></div><div class="client-actions"><button class="btn btn-sm btn-ghost" style="flex:1" onclick="showDetail(\''+c.id+'\')">Конфиг / QR</button><button class="btn btn-sm btn-red" onclick="delClient(\''+c.id+'\',\''+esc(c.name)+'\')">Удалить</button></div></div>')})}catch(e){}}
 function showAddClient(){document.getElementById('new-name').value='';document.getElementById('modal-add').classList.add('show');document.getElementById('new-name').focus()}
 async function addClient(){const n=document.getElementById('new-name').value.trim();if(!n)return;try{const r=await fetch('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}),d=await r.json();if(d.error){alert(d.error);return}closeModal('modal-add');await loadClients();showDetailData(d.id,d.name,d.link)}catch(e){alert('Error: '+e)}}
 async function delClient(id,n){if(!confirm('Удалить "'+n+'"?'))return;try{await fetch('/api/clients/'+id,{method:'DELETE'});loadClients()}catch(e){alert('Error: '+e)}}

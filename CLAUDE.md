@@ -29,7 +29,7 @@ The main artifact. Self-contained bash script that embeds all configs as heredoc
 - `SERVER_IP` and `IFACE` — auto-detected from `ip route get 1.1.1.1`
 - `PRIV_KEY` / `PUB_KEY` — `xray x25519` keypair
 - `CLIENT_UUID` — from `/proc/sys/kernel/random/uuid`
-- `SHORT_ID` — `openssl rand -hex 8`
+- `SHORT_ID` — `openssl rand -hex 8` (the *initial* shortId, kept as the global fallback; per-client shortIds are added later by the dashboard)
 
 **Placeholder pattern**: app.py uses `__SERVER_IP__`, `__REALITY_PBK__`, `__REALITY_SID__`, `__NET_IFACE__` replaced by `sed` after heredoc write.
 
@@ -63,8 +63,8 @@ The Flask app and HTML template are **only** inside `vpn-setup.sh` heredocs — 
 - `GET /api/system` — CPU, RAM, disk, network, Xray status
 - `GET /api/history?range=1h|6h|24h` — time-series metrics from background collector
 - `GET /api/clients` — list clients with traffic stats from Xray Stats API
-- `POST /api/clients` — add client (writes to xray config + clients.json, restarts Xray)
-- `DELETE /api/clients/<id>` — remove client
+- `POST /api/clients` — add client (writes to xray config + clients.json, generates a per-client `shortId` via `secrets.token_hex(8)` and appends it to `realitySettings.shortIds[]`, then restarts Xray). REALITY's hard limit is 8 entries in `shortIds[]` — when reached, the new client falls back to the global `SHORT_ID` and the response sets `pooled: true`.
+- `DELETE /api/clients/<id>` — remove client and prune its shortId from `shortIds[]` if no other client uses it. The original global `SHORT_ID` is never pruned (legacy clients without a `shortId` field in `clients.json` keep working through it).
 - `GET /api/clients/<id>/qr` — QR code as SVG
 - `GET /api/netflow` — parsed access log (last 500 lines)
 - `GET /api/netflow/stats` — aggregated netflow (hourly, protocols, top destinations, per-client)
@@ -113,4 +113,5 @@ cat /opt/vpn-credentials.txt       # VLESS link for client
 - **NET_IFACE is not always `ens1`**: The script auto-detects it and injects via `sed` (`__NET_IFACE__` placeholder)
 - **Xray config mode 644, not 600**: Xray runs as `nobody` (see `User=nobody` in systemd unit); config needs world-readable permissions
 - **DNS leak protection** lives in two places: section `6b` configures systemd-resolved with DoT (system-level), and section `7` (Xray config heredoc) includes Xray's DoH DNS module (Cloudflare + Google) plus `domainStrategy: UseIPv4` on the `freedom` outbound so domains resolve via Xray's DNS, not the OS resolver
+- **Per-client shortIds**: Dashboard generates a fresh `shortId` for each new client and appends it to `realitySettings.shortIds[]` (max 8 — REALITY hard limit). Each client's `clients.json` entry stores `shortId` so QR/link generation picks the right one. Clients that predate this feature have no `shortId` field and use the global fallback (`REALITY_SID` constant in app.py, set from `SHORT_ID` at install). When migrating an old client to a per-client sid, delete and re-add it via the dashboard
 - **Fail2ban uses nftables, not iptables**: Rules live in table `inet f2b-table` (inspect with `nft list table inet f2b-table`), NOT visible via `iptables -L`. The main firewall (section 15) is still iptables — two separate subsystems coexist. To override ban behavior (e.g. drop vs reject), create `/etc/fail2ban/action.d/nftables.local` with `[Init]` / `blocktype = drop` — never edit `nftables.conf` directly (package updates overwrite it)

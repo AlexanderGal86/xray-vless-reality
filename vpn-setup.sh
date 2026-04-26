@@ -51,6 +51,9 @@ echo "[+] Client UUID: $CLIENT_UUID"
 
 # ── 5. Create directories ───────────────────────────────
 mkdir -p /opt/vpn-dashboard/templates /opt/vpn-dashboard/static /var/log/xray
+touch /var/log/xray/access.log /var/log/xray/error.log
+chown nobody:nogroup /var/log/xray/access.log /var/log/xray/error.log
+chmod 644 /var/log/xray/error.log
 
 # ── 5b. Download Chart.js (served locally due to CSP) ───
 echo "[*] Downloading Chart.js..."
@@ -108,7 +111,8 @@ cat > /usr/local/etc/xray/config.json << XRAYEOF
   },
   "log": {
     "loglevel": "warning",
-    "access": "/var/log/xray/access.log"
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
   },
   "stats": {},
   "api": {
@@ -781,7 +785,7 @@ bantime.factor = 2
 bantime.maxtime = 1w
 findtime = 10m
 maxretry = 5
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = 127.0.0.1/8 ::1 188.242.249.138
 
 [sshd]
 enabled = true
@@ -803,8 +807,19 @@ echo "[*] Hardening SSH..."
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sed -i 's/^#*X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
 sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
+# Idle session timeout: 60s × 20 = 1200s (20 min) before disconnect
+if grep -qE '^#*ClientAliveInterval' /etc/ssh/sshd_config; then
+  sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 60/' /etc/ssh/sshd_config
+else
+  echo 'ClientAliveInterval 60' >> /etc/ssh/sshd_config
+fi
+if grep -qE '^#*ClientAliveCountMax' /etc/ssh/sshd_config; then
+  sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 20/' /etc/ssh/sshd_config
+else
+  echo 'ClientAliveCountMax 20' >> /etc/ssh/sshd_config
+fi
 sshd -t && systemctl reload ssh
-echo "[+] SSH hardened (no root, no X11, max 3 tries)"
+echo "[+] SSH hardened (no root, no X11, max 3 tries, idle timeout 20 min)"
 
 # ── 15. Firewall (whitelist) ───────────────────────────
 echo "[*] Configuring firewall..."
@@ -822,6 +837,10 @@ iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 # Allow DHCP
 iptables -A INPUT -p udp --dport 68 -j ACCEPT
+# MSS clamp on :443 — fixes "client connects but no traffic" when upstream
+# link has MTU<1500 and PMTU discovery fails (some hosting providers / RU ISPs)
+iptables -t mangle -A POSTROUTING -p tcp --sport 443 --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+iptables -t mangle -A PREROUTING  -p tcp --dport 443 --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
 # IPv6: drop all inbound
 ip6tables -P INPUT DROP
 ip6tables -F INPUT

@@ -66,13 +66,15 @@ The Flask app and HTML template are **only** inside `vpn-setup.sh` heredocs — 
 - `POST /api/clients` — add client (writes to xray config + clients.json, generates a per-client `shortId` via `secrets.token_hex(8)` and appends it to `realitySettings.shortIds[]`, then restarts Xray). REALITY's hard limit is 8 entries in `shortIds[]` — when reached, the new client falls back to the global `SHORT_ID` and the response sets `pooled: true`.
 - `DELETE /api/clients/<id>` — remove client and prune its shortId from `shortIds[]` if no other client uses it. The original global `SHORT_ID` is never pruned (legacy clients without a `shortId` field in `clients.json` keep working through it).
 - `GET /api/clients/<id>/qr` — QR code as SVG
-- `GET /api/netflow` — parsed access log (last 500 lines)
+- `GET /api/netflow` — parsed access log (last 500 lines). Frontend filter (`filterNetflow()` in HTML heredoc) joins all entry fields (`time, source, status, proto, dest, route, email`) into one string and does whitespace-tokenized AND match (e.g. `tcp accepted` matches rows containing both). When adding a column to the netflow table, also extend the `hay()` join — otherwise the new field won't be searchable.
 - `GET /api/netflow/stats` — aggregated netflow (hourly, protocols, top destinations, per-client)
 - `POST /api/xray/restart` — restart Xray service
 
 **Important pattern — `restart_xray_bg()`**: Xray restart is delayed 1.5s in a thread so the HTTP response reaches the client first. This matters because the VPN tunnel carries the HTTP request — restarting Xray immediately would kill the connection before the response is sent.
 
 **Metrics collector thread**: `metrics_collector()` samples CPU/RAM/net/conns every 30s into `deque(maxlen=2880)` (24h history), persists to `metrics_history.json` every 5min. Started as daemon thread before `app.run()`.
+
+**Client-name transliteration**: The "new client" form whitelists `[A-Za-z0-9 _-]` and transliterates Cyrillic on the fly. Two parallel implementations of the same map exist — `translit_name()` in `app.py` (server-side, also defends against direct curl) and `TR`/`translit()`/`translitName()` in the HTML heredoc (UX). When extending the alphabet (e.g. adding Ukrainian `і/ї/є`), update **both** maps. Pre-existing clients with Cyrillic names are not retroactively migrated — delete + re-add via UI to normalize.
 
 ## Common Tasks
 
@@ -81,7 +83,19 @@ The Flask app and HTML template are **only** inside `vpn-setup.sh` heredocs — 
 2. If UI needed, edit the embedded HTML heredoc (search `HTMLEOF`)
 3. Add rate limiting decorator if the endpoint mutates state
 4. Regenerate `cloud-init.yml`
-5. For testing, also update the live `/opt/vpn-dashboard/app.py` on the dev server and `systemctl restart vpn-dashboard`
+5. Mirror the change to the live dashboard (see below) — `vpn-setup.sh` is only consumed by cloud-init on a fresh deploy, edits there don't affect a running server
+
+### Mirroring edits to the live dashboard
+`vpn-setup.sh` is the source of truth for *new* deploys, not a runtime artifact. After editing its `APPEOF`/`HTMLEOF` heredocs, replicate the same edit in:
+- `/opt/vpn-dashboard/app.py` (already has `__SERVER_IP__` etc. substituted — don't overwrite the whole file, just edit the lines you changed)
+- `/opt/vpn-dashboard/templates/index.html`
+
+Then:
+```bash
+python3 -c "import ast; ast.parse(open('/opt/vpn-dashboard/app.py').read())"  # syntax check
+systemctl restart vpn-dashboard && systemctl is-active vpn-dashboard
+```
+Hard-refresh the browser (Ctrl+F5) when changing `index.html` — the dashboard sets no cache headers and Chrome will hold the old file.
 
 ### Changing firewall rules
 Rules are in section `# ── 15. Firewall` of `vpn-setup.sh`. Current whitelist:

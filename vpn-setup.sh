@@ -254,6 +254,19 @@ REALITY_SID = '__REALITY_SID__'
 XRAY_API = '127.0.0.1:10085'
 NET_IFACE = '__NET_IFACE__'
 
+_TR = {'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh',
+       'з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o',
+       'п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'ts',
+       'ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'}
+def translit_name(s):
+    out = []
+    for ch in s:
+        low = ch.lower(); t = _TR.get(low)
+        if t is None: out.append(ch)
+        elif ch == low: out.append(t)
+        else: out.append(t[:1].upper() + t[1:])
+    return re.sub(r'[^A-Za-z0-9 _-]', '', ''.join(out))[:32]
+
 metrics_history = deque(maxlen=2880)
 _prev_net = {'tx': 0, 'rx': 0, 'ts': 0}
 
@@ -433,7 +446,7 @@ def api_clients():
 @app.route('/api/clients', methods=['POST'])
 @limiter.limit("10 per minute")
 def api_add_client():
-    data = request.get_json() or {}; name = data.get('name','').strip()
+    data = request.get_json() or {}; name = translit_name(data.get('name','').strip())
     if not name: return jsonify({'error':'Name required'}), 400
     cid = str(uuid.uuid4()); email = f"{re.sub(r'[^a-z0-9]', '-', name.lower())}@vpn"
     sid = secrets.token_hex(8)
@@ -628,11 +641,11 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 <div class="nf-chart-card"><div class="chart-title">Протоколы</div><div class="doughnut-wrap"><canvas id="chart-nf-proto"></canvas></div></div>
 <div class="nf-chart-card"><div class="chart-title">Топ направления</div><div class="nf-chart-wrap"><canvas id="chart-nf-dests"></canvas></div></div>
 </div>
-<div class="filter-row"><input type="search" id="nf-search" placeholder="Фильтр по IP, домену, email..." oninput="filterNetflow()"></div>
+<div class="filter-row"><input type="search" id="nf-search" placeholder="Фильтр: IP, домен, email, tcp/udp, accepted, время — можно несколько слов" oninput="filterNetflow()" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></div>
 <div class="table-wrap"><table><thead><tr><th>Время</th><th>Источник</th><th>Статус</th><th>Назначение</th><th>Маршрут</th><th>Клиент</th></tr></thead><tbody id="nf-table"></tbody></table></div>
 </section>
 </main>
-<div class="modal-overlay" id="modal-add"><div class="modal"><button class="modal-close" onclick="closeModal('modal-add')">&times;</button><h3>Новый клиент</h3><div class="form-group"><label>Имя устройства</label><input type="text" id="new-name" placeholder="Телефон, Ноутбук и т.д."></div><button class="btn btn-blue" onclick="addClient()">Создать</button></div></div>
+<div class="modal-overlay" id="modal-add"><div class="modal"><button class="modal-close" onclick="closeModal('modal-add')">&times;</button><h3>Новый клиент</h3><div class="form-group"><label>Имя устройства</label><input type="text" id="new-name" maxlength="32" oninput="translitName(this)" placeholder="Phone, Laptop, ..."></div><button class="btn btn-blue" onclick="addClient()">Создать</button></div></div>
 <div class="modal-overlay" id="modal-detail"><div class="modal"><button class="modal-close" onclick="closeModal('modal-detail')">&times;</button><h3 id="detail-title">Клиент</h3><div id="detail-qr" class="qr-wrap"></div><label>Ссылка для импорта (скопируй в v2rayNG):</label><div class="link-box" id="detail-link"><button class="btn btn-sm btn-ghost copy-btn" onclick="copyLink()">Копировать</button><span id="detail-link-text"></span></div><details style="margin-top:12px"><summary style="cursor:pointer;color:var(--text2);font-size:13px">Параметры вручную</summary><table style="margin-top:8px;font-size:12px" id="detail-params"></table></details></div></div>
 <script src="/static/chart.min.js"></script>
 <script>
@@ -727,8 +740,11 @@ async function loadNetflowCharts(){
 }
 async function loadNetflow(){loadNetflowCharts();try{const r=await fetch('/api/netflow');netflowData=await r.json();renderNF(netflowData)}catch(e){}}
 function renderNF(data){const tb=document.getElementById('nf-table');if(!data.length){tb.textContent='';const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=6;td.style.cssText='text-align:center;color:var(--text2);padding:32px';td.textContent='Нет записей';tr.appendChild(td);tb.appendChild(tr);return}tb.textContent='';data.slice(0,200).forEach(function(e){const tr=document.createElement('tr');tr.insertAdjacentHTML('beforeend','<td class="mono" style="white-space:nowrap">'+esc(e.time)+'</td><td class="mono">'+esc(e.source)+'</td><td><span class="badge '+(e.status==='accepted'?'badge-green':'badge-red')+'">'+esc(e.status)+'</span></td><td class="mono">'+esc(e.dest)+'</td><td style="color:var(--text2);font-size:12px">'+esc(e.route||'')+'</td><td class="mono">'+esc(e.email)+'</td>');tb.appendChild(tr)})}
-function filterNetflow(){const q=document.getElementById('nf-search').value.toLowerCase();if(!q){renderNF(netflowData);return}renderNF(netflowData.filter(e=>e.source.toLowerCase().includes(q)||e.dest.toLowerCase().includes(q)||e.email.toLowerCase().includes(q)||(e.route||'').toLowerCase().includes(q)))}
+function filterNetflow(){const q=document.getElementById('nf-search').value.trim().toLowerCase();if(!q){renderNF(netflowData);return}const toks=q.split(/\s+/).filter(Boolean);const hay=e=>(e.time+' '+e.source+' '+e.status+' '+e.proto+' '+e.dest+' '+(e.route||'')+' '+(e.email||'')).toLowerCase();renderNF(netflowData.filter(e=>{const h=hay(e);return toks.every(t=>h.includes(t))}))}
 async function loadClients(){try{const r=await fetch('/api/clients');currentClients=await r.json();const el=document.getElementById('clients-list');if(!currentClients.length){el.textContent='Нет клиентов';el.style.cssText='text-align:center;color:var(--text2);padding:32px';return}el.style.cssText='';el.textContent='';currentClients.forEach(function(c){el.insertAdjacentHTML('beforeend','<div class="client-card"><div class="client-header"><div><div class="client-name">'+esc(c.name)+'</div><div class="client-email">'+esc(c.email)+'</div><div class="client-sid">sid: '+esc(c.sid||'')+(c.pooled?'<span class="shared">общий</span>':'')+'</div></div><span class="badge badge-green" style="font-size:10px">'+esc(c.created)+'</span></div><div class="client-stats"><div><div class="client-stat-label">Upload</div><div class="client-stat-val" style="color:var(--purple)">'+fmtB(c.up)+'</div></div><div><div class="client-stat-label">Download</div><div class="client-stat-val" style="color:var(--blue)">'+fmtB(c.down)+'</div></div><div><div class="client-stat-label">Всего</div><div class="client-stat-val">'+fmtB(c.up+c.down)+'</div></div></div><div class="client-actions"><button class="btn btn-sm btn-ghost" style="flex:1" onclick="showDetail(\''+c.id+'\')">Конфиг / QR</button><button class="btn btn-sm btn-red" onclick="delClient(\''+c.id+'\',\''+esc(c.name)+'\')">Удалить</button></div></div>')})}catch(e){}}
+const TR={а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'yo',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'ts',ч:'ch',ш:'sh',щ:'shch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya'};
+function translit(s){return s.split('').map(c=>{const l=c.toLowerCase(),t=TR[l];if(t===undefined)return c;return c===l?t:t.charAt(0).toUpperCase()+t.slice(1)}).join('')}
+function translitName(el){const v=translit(el.value).replace(/[^A-Za-z0-9 _-]/g,'');if(v!==el.value){const p=el.selectionStart;el.value=v;try{el.setSelectionRange(p,p)}catch(e){}}}
 function showAddClient(){document.getElementById('new-name').value='';document.getElementById('modal-add').classList.add('show');document.getElementById('new-name').focus()}
 async function addClient(){const n=document.getElementById('new-name').value.trim();if(!n)return;try{const r=await fetch('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}),d=await r.json();if(d.error){alert(d.error);return}closeModal('modal-add');await loadClients();showDetailData(d.id,d.name,d.link)}catch(e){alert('Error: '+e)}}
 async function delClient(id,n){if(!confirm('Удалить "'+n+'"?'))return;try{await fetch('/api/clients/'+id,{method:'DELETE'});loadClients()}catch(e){alert('Error: '+e)}}

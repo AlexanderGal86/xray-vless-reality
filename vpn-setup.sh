@@ -910,7 +910,12 @@ echo "[+] Xray: $XRAY_OK"
 echo "[+] Dashboard: $DASH_OK"
 echo "[+] Fail2ban: $F2B_OK"
 
-# ── 18. Output ──────────────────────────────────────────
+# ── 18. Schedule daily reboot at 11:00 ─────────────────────
+echo "[*] Scheduling daily reboot at 11:00..."
+echo "0 11 * * * /sbin/reboot" | crontab -
+echo "[+] Daily reboot scheduled"
+
+# ── 19. Output ──────────────────────────────────────────
 VLESS_LINK="vless://${CLIENT_UUID}@${SERVER_IP}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.google.com&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#VPN"
 
 echo ""

@@ -29,7 +29,7 @@ echo "[*] Interface:  $IFACE"
 echo "[*] Installing packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3-flask python3-psutil qrencode curl unzip openssl fail2ban > /dev/null 2>&1
+apt-get install -y -qq python3-flask python3-psutil qrencode curl unzip openssl fail2ban wireguard > /dev/null 2>&1
 pip3 install --break-system-packages flask-limiter > /dev/null 2>&1
 echo "[+] Packages installed"
 
@@ -48,6 +48,13 @@ SHORT_ID=$(openssl rand -hex 8)
 
 echo "[+] REALITY keys generated"
 echo "[+] Client UUID: $CLIENT_UUID"
+
+# ── 4b. Generate WireGuard keys ─────────────────────────
+WG_SERVER_PRIV=$(wg genkey)
+WG_SERVER_PUB=$(echo "$WG_SERVER_PRIV" | wg pubkey)
+WG_CLIENT1_PRIV=$(wg genkey)
+WG_CLIENT1_PUB=$(echo "$WG_CLIENT1_PRIV" | wg pubkey)
+echo "[+] WireGuard server key generated"
 
 # ── 5. Create directories ───────────────────────────────
 mkdir -p /opt/vpn-dashboard/templates /opt/vpn-dashboard/static /var/log/xray
@@ -163,9 +170,9 @@ cat > /usr/local/etc/xray/config.json << XRAYEOF
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "www.google.com:443",
+          "dest": "www.microsoft.com:443",
           "xver": 0,
-          "serverNames": ["www.google.com", "google.com"],
+          "serverNames": ["www.microsoft.com", "microsoft.com", "www.google.com", "google.com"],
           "privateKey": "${PRIV_KEY}",
           "shortIds": ["${SHORT_ID}"]
         }
@@ -247,12 +254,16 @@ ACCESS_LOG = '/var/log/xray/access.log'
 METRICS_FILE = '/opt/vpn-dashboard/metrics_history.json'
 SERVER_IP = '__SERVER_IP__'
 SERVER_PORT = 443
-REALITY_SNI = 'www.google.com'
+REALITY_SNI = 'www.microsoft.com'
 REALITY_FP = 'chrome'
 REALITY_PBK = '__REALITY_PBK__'
 REALITY_SID = '__REALITY_SID__'
 XRAY_API = '127.0.0.1:10085'
 NET_IFACE = '__NET_IFACE__'
+WG_SUBNET = '10.0.20.0/24'
+WG_SERVER_ADDR = '10.0.20.1'
+WG_PORT = 51820
+WG_DNS = '1.1.1.1, 8.8.8.8'
 
 _TR = {'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh',
        'з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o',
@@ -323,6 +334,45 @@ def restart_xray_bg():
         time.sleep(1.5)
         subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
     threading.Thread(target=_r, daemon=True).start()
+
+def load_wg_db():
+    return load_json('/opt/vpn-dashboard/wg_clients.json',
+                     {'server_private_key':'','server_public_key':'','next_ip':2,'clients':[]})
+
+def save_wg_db(data):
+    save_json('/opt/vpn-dashboard/wg_clients.json', data)
+
+def regenerate_wg_conf(data):
+    iface = NET_IFACE
+    lines = ['[Interface]',
+             f'Address = {WG_SERVER_ADDR}/24',
+             f'ListenPort = {WG_PORT}',
+             f'PrivateKey = {data["server_private_key"]}',
+             f'PostUp = iptables -t nat -A POSTROUTING -s {WG_SUBNET} -o {iface} -j MASQUERADE; iptables -A FORWARD -s {WG_SUBNET} -j ACCEPT; iptables -A FORWARD -d {WG_SUBNET} -j ACCEPT',
+             f'PostDown = iptables -t nat -D POSTROUTING -s {WG_SUBNET} -o {iface} -j MASQUERADE; iptables -D FORWARD -s {WG_SUBNET} -j ACCEPT; iptables -D FORWARD -d {WG_SUBNET} -j ACCEPT',
+             '']
+    for c in data.get('clients', []):
+        if c.get('enabled', True):
+            lines.extend([f'[Peer]', f'PublicKey = {c["public_key"]}', f'AllowedIPs = {c["address"]}', ''])
+    with open('/etc/wireguard/wg0.conf', 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+def restart_wg_bg():
+    def _r():
+        time.sleep(1.5)
+        subprocess.run(['systemctl','restart','wg-quick@wg0'], capture_output=True, timeout=15)
+    threading.Thread(target=_r, daemon=True).start()
+
+def wg_client_conf(client, data):
+    return ('[Interface]\n'
+            f'PrivateKey = {client["private_key"]}\n'
+            f'Address = {client["address"]}\n'
+            f'DNS = {WG_DNS}\n\n'
+            '[Peer]\n'
+            f'PublicKey = {data["server_public_key"]}\n'
+            f'Endpoint = {SERVER_IP}:{WG_PORT}\n'
+            'AllowedIPs = 0.0.0.0/0\n'
+            'PersistentKeepalive = 25\n')
 
 def vless_link(client_uuid, name='VPN', sid=None):
     return (f"vless://{client_uuid}@{SERVER_IP}:{SERVER_PORT}"
@@ -507,6 +557,57 @@ def api_restart_xray():
     active = subprocess.run(['systemctl','is-active','xray'], capture_output=True, text=True).stdout.strip() == 'active'
     return jsonify({'ok':active})
 
+@app.route('/api/wg/status')
+def api_wg_status():
+    db = load_wg_db()
+    return jsonify({'public_key':db.get('server_public_key',''),
+                    'endpoint':f'{SERVER_IP}:{WG_PORT}',
+                    'peers':len([c for c in db.get('clients',[]) if c.get('enabled',True)]),
+                    'total_clients':len(db.get('clients',[]))})
+
+@app.route('/api/wg/clients')
+def api_wg_clients():
+    return jsonify(load_wg_db().get('clients',[]))
+
+@app.route('/api/wg/clients', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_wg_add_client():
+    data = request.get_json() or {}; name = translit_name(data.get('name','').strip())
+    if not name: return jsonify({'error':'Name required'}), 400
+    db = load_wg_db(); cid = str(uuid.uuid4())
+    cp = subprocess.run(['wg','genkey'], capture_output=True, text=True, timeout=5).stdout.strip()
+    cpub = subprocess.run(['wg','pubkey'], input=cp, capture_output=True, text=True, timeout=5).stdout.strip()
+    ip_idx = db.get('next_ip',2); address = f'10.0.20.{ip_idx}/32'
+    client = {'id':cid,'name':name,'private_key':cp,'public_key':cpub,
+              'address':address,'enabled':True,'created_at':datetime.now().strftime('%Y-%m-%d %H:%M')}
+    db['clients'].append(client); db['next_ip'] = ip_idx + 1
+    save_wg_db(db); regenerate_wg_conf(db); restart_wg_bg()
+    conf = wg_client_conf(client, db); svg = qr_svg(conf)
+    return jsonify({'id':cid,'name':name,'address':address,'public_key':cpub,
+                    'created_at':client['created_at'],'config':conf,'qr_svg':svg})
+
+@app.route('/api/wg/clients/<cid>', methods=['DELETE'])
+@limiter.limit("10 per minute")
+def api_wg_del_client(cid):
+    db = load_wg_db(); before = len(db['clients'])
+    db['clients'] = [c for c in db['clients'] if c['id'] != cid]
+    if len(db['clients']) == before: return jsonify({'error':'Not found'}), 404
+    save_wg_db(db); regenerate_wg_conf(db); restart_wg_bg()
+    return jsonify({'ok':True})
+
+@app.route('/api/wg/clients/<cid>/config')
+def api_wg_client_config(cid):
+    db = load_wg_db()
+    client = next((c for c in db['clients'] if c['id'] == cid), None)
+    if not client: return jsonify({'error':'Not found'}), 404
+    conf = wg_client_conf(client, db)
+    if request.args.get('format') == 'qr':
+        svg = qr_svg(conf)
+        if svg: return Response(svg, mimetype='image/svg+xml')
+        return jsonify({'error':'QR failed'}), 500
+    return Response(conf, mimetype='text/plain',
+                    headers={'Content-Disposition':f'attachment; filename="wg-{client["name"]}.conf"'})
+
 if __name__ == '__main__':
     if not os.path.exists(CLIENTS_DB): save_json(CLIENTS_DB, {})
     threading.Thread(target=metrics_collector, daemon=True).start()
@@ -617,7 +718,7 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 @media(max-width:640px){header{padding:6px 10px;gap:6px}main{padding:10px}.stats{grid-template-columns:1fr 1fr;gap:8px}.stat-card{padding:12px}.stat-value{font-size:20px}.stat-label{font-size:10px}nav button{padding:6px 8px;font-size:12px}td,th{padding:6px 8px;font-size:11px}.mono{font-size:10px}.toolbar h2{font-size:14px}.btn{padding:6px 12px;font-size:12px}.btn-sm{padding:4px 8px;font-size:11px}.modal{padding:16px;border-radius:12px;margin:8px}.modal-overlay{padding:8px}.qr-wrap svg{width:200px;height:200px}.link-box{font-size:10px;padding:10px}.status-bar{gap:6px}.status-item{padding:8px 10px;min-width:90px}.status-value{font-size:14px}.chart-wrap{height:130px}}
 @media(max-width:380px){.status-bar{flex-direction:column}.chart-wrap{height:120px}}
 </style></head><body>
-<header><h1><span>&#9670;</span> VPN Dashboard</h1><nav><button class="active" data-tab="overview">Обзор</button><button data-tab="clients">Клиенты</button><button data-tab="netflow">Netflow</button></nav></header>
+<header><h1><span>&#9670;</span> VPN Dashboard</h1><nav><button class="active" data-tab="overview">Обзор</button><button data-tab="clients">Клиенты</button><button data-tab="netflow">Netflow</button><button data-tab="wireguard">WireGuard</button></nav></header>
 <main>
 <section id="overview" class="active">
 <div class="status-bar" id="status-bar"></div>
@@ -644,9 +745,16 @@ label{font-size:13px;color:var(--text2);margin-bottom:6px;display:block}
 <div class="filter-row"><input type="search" id="nf-search" placeholder="Фильтр: IP, домен, email, tcp/udp, accepted, время — можно несколько слов" oninput="filterNetflow()" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></div>
 <div class="table-wrap"><table><thead><tr><th>Время</th><th>Источник</th><th>Статус</th><th>Назначение</th><th>Маршрут</th><th>Клиент</th></tr></thead><tbody id="nf-table"></tbody></table></div>
 </section>
+<section id="wireguard">
+<div class="toolbar"><h2>WireGuard</h2><button class="btn btn-blue" onclick="showAddWg()">+ Добавить клиента</button></div>
+<div id="wg-status" class="status-bar"></div>
+<div id="wg-clients-list"></div>
+</section>
 </main>
 <div class="modal-overlay" id="modal-add"><div class="modal"><button class="modal-close" onclick="closeModal('modal-add')">&times;</button><h3>Новый клиент</h3><div class="form-group"><label>Имя устройства</label><input type="text" id="new-name" maxlength="32" oninput="translitName(this)" placeholder="Phone, Laptop, ..."></div><button class="btn btn-blue" onclick="addClient()">Создать</button></div></div>
 <div class="modal-overlay" id="modal-detail"><div class="modal"><button class="modal-close" onclick="closeModal('modal-detail')">&times;</button><h3 id="detail-title">Клиент</h3><div id="detail-qr" class="qr-wrap"></div><label>Ссылка для импорта (скопируй в v2rayNG):</label><div class="link-box" id="detail-link"><button class="btn btn-sm btn-ghost copy-btn" onclick="copyLink()">Копировать</button><span id="detail-link-text"></span></div><details style="margin-top:12px"><summary style="cursor:pointer;color:var(--text2);font-size:13px">Параметры вручную</summary><table style="margin-top:8px;font-size:12px" id="detail-params"></table></details></div></div>
+<div class="modal-overlay" id="modal-wg-add"><div class="modal"><button class="modal-close" onclick="closeModal('modal-wg-add')">&times;</button><h3>Новый WireGuard клиент</h3><div class="form-group"><label>Имя устройства</label><input type="text" id="wg-new-name" maxlength="32" oninput="translitName(this)" placeholder="Phone, Laptop, ..."></div><button class="btn btn-blue" onclick="addWgClient()">Создать</button></div></div>
+<div class="modal-overlay" id="modal-wg-detail"><div class="modal"><button class="modal-close" onclick="closeModal('modal-wg-detail')">&times;</button><h3 id="wg-detail-title">WireGuard клиент</h3><div id="wg-detail-qr" class="qr-wrap"></div><label>Конфигурация (импортируй в WireGuard приложение):</label><div class="link-box" id="wg-detail-config"><button class="btn btn-sm btn-ghost copy-btn" onclick="copyWgConfig()">Копировать</button><span id="wg-detail-config-text" style="white-space:pre-wrap;font-size:11px"></span></div></div></div>
 <script src="/static/chart.min.js"></script>
 <script>
 /* NOTE: All user-supplied data is escaped via esc() before DOM insertion */
@@ -759,7 +867,18 @@ document.getElementById('new-name').addEventListener('keydown',e=>{if(e.key==='E
 document.querySelectorAll('nav button').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('section').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.tab).classList.add('active');if(b.dataset.tab==='clients')loadClients();if(b.dataset.tab==='netflow')loadNetflow();if(b.dataset.tab==='overview'){loadHistory();loadTrafficChart()}})});
 document.querySelectorAll('.range-btn').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('.range-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentRange=b.dataset.r;loadHistory()})});
 async function restartXray(){if(!confirm('Перезапустить Xray?'))return;try{const r=await fetch('/api/xray/restart',{method:'POST'}),d=await r.json();alert(d.ok?'Xray перезапущен':'Ошибка');loadSystem()}catch(e){alert('Error: '+e)}}
-initCharts();loadSystem();loadHistory();loadTrafficChart();setInterval(loadSystem,5000);setInterval(loadHistory,30000);
+/* WireGuard */
+async function loadWgStatus(){try{const r=await fetch('/api/wg/status'),d=await r.json();document.getElementById('wg-status').innerHTML='<div class=\"status-item\"><div><div class=\"status-label\">Public Key</div><div class=\"status-value mono\" style=\"font-size:12px\">'+esc(d.public_key)+'</div></div></div><div class=\"status-item\"><div><div class=\"status-label\">Endpoint</div><div class=\"status-value mono\" style=\"font-size:12px\">'+esc(d.endpoint)+'</div></div></div><div class=\"status-item\"><div><div class=\"status-label\">Peers</div><div class=\"status-value green\">'+d.peers+' / '+d.total_clients+'</div></div></div>'}catch(e){}}
+async function loadWgClients(){try{const r=await fetch('/api/wg/clients'),cl=await r.json();const el=document.getElementById('wg-clients-list');if(!cl.length){el.textContent='Нет клиентов';el.style.cssText='text-align:center;color:var(--text2);padding:32px';return}el.style.cssText='';el.innerHTML=cl.map(c=>'<div class=\"client-card\"><div class=\"client-header\"><div><div class=\"client-name\">'+esc(c.name)+'</div><div class=\"client-email\">'+esc(c.address)+'</div></div><span class=\"badge badge-green\" style=\"font-size:10px\">'+esc(c.created_at)+'</span></div><div class=\"client-actions\"><button class=\"btn btn-sm btn-ghost\" style=\"flex:1\" onclick=\"showWgDetail(\''+c.id+'\',\''+esc(c.name)+'\')\">Конфиг / QR</button><button class=\"btn btn-sm btn-red\" onclick=\"delWgClient(\''+c.id+'\',\''+esc(c.name)+'\')\">Удалить</button></div></div>').join('')}catch(e){}}
+function showAddWg(){document.getElementById('wg-new-name').value='';document.getElementById('modal-wg-add').classList.add('show');document.getElementById('wg-new-name').focus()}
+async function addWgClient(){const n=document.getElementById('wg-new-name').value.trim();if(!n)return;try{const r=await fetch('/api/wg/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})}),d=await r.json();if(d.error){alert(d.error);return}closeModal('modal-wg-add');await loadWgClients();showWgDetailData(d.name,d.config,d.qr_svg)}catch(e){alert('Error: '+e)}}
+async function delWgClient(id,n){if(!confirm('Удалить WireGuard \"'+n+'\"?'))return;try{await fetch('/api/wg/clients/'+id,{method:'DELETE'});loadWgClients()}catch(e){alert('Error: '+e)}}
+let _wgConfigText='';
+function showWgDetail(id,name){const confUrl='/api/wg/clients/'+id+'/config';const qrUrl=confUrl+'?format=qr';fetch(qrUrl).then(r=>r.text()).then(svg=>{document.getElementById('wg-detail-qr').innerHTML=svg;showWgDetailData(name,'',svg)}).catch(()=>{document.getElementById('wg-detail-qr').innerHTML='<div style=\"color:var(--text2)\">QR unavailable</div>';showWgDetailData(name,'',null)});fetch(confUrl).then(r=>r.text()).then(t=>{_wgConfigText=t;document.getElementById('wg-detail-config-text').textContent=t})}
+function showWgDetailData(name,conf,qrSvg){document.getElementById('wg-detail-title').textContent='WireGuard: '+esc(name);if(qrSvg)document.getElementById('wg-detail-qr').innerHTML=qrSvg;if(conf)document.getElementById('wg-detail-config-text').textContent=conf;document.getElementById('modal-wg-detail').classList.add('show')}
+function copyWgConfig(){const t=_wgConfigText;const b=document.querySelector('#wg-detail-config .copy-btn');copyText(t).then(()=>{b.textContent='Скопировано!';setTimeout(()=>b.textContent='Копировать',1500)}).catch(()=>{b.textContent='Не удалось';setTimeout(()=>b.textContent='Копировать',2500)})}
+document.getElementById('wg-new-name').addEventListener('keydown',function(e){if(e.key==='Enter')addWgClient()});
+initCharts();loadSystem();loadHistory();loadTrafficChart();loadWgStatus();loadWgClients();setInterval(loadSystem,5000);setInterval(loadHistory,30000);setInterval(loadWgStatus,15000);setInterval(loadWgClients,15000);
 </script></body></html>
 HTMLEOF
 echo "[+] Dashboard HTML written"
@@ -775,6 +894,26 @@ cat > /opt/vpn-dashboard/clients.json << CLIENTSEOF
   }
 }
 CLIENTSEOF
+
+# ── 10b. WireGuard clients database ─────────────────────
+cat > /opt/vpn-dashboard/wg_clients.json << WGDBEOF
+{
+  "server_private_key": "${WG_SERVER_PRIV}",
+  "server_public_key": "${WG_SERVER_PUB}",
+  "next_ip": 3,
+  "clients": [
+    {
+      "id": "${CLIENT_UUID}",
+      "name": "Default",
+      "private_key": "${WG_CLIENT1_PRIV}",
+      "public_key": "${WG_CLIENT1_PUB}",
+      "address": "10.0.20.2/32",
+      "enabled": true,
+      "created_at": "${NOW}"
+    }
+  ]
+}
+WGDBEOF
 
 # ── 11. Systemd service ─────────────────────────────────
 cat > /etc/systemd/system/vpn-dashboard.service << 'SVCEOF'
@@ -859,6 +998,23 @@ fi
 sshd -t && systemctl reload ssh
 echo "[+] SSH hardened (no root, no X11, max 3 tries, idle timeout 20 min)"
 
+# ── 14b. WireGuard config ──────────────────────────────
+echo "[*] Configuring WireGuard..."
+mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg0.conf << WGCFGEOF
+[Interface]
+Address = 10.0.20.1/24
+ListenPort = 51820
+PrivateKey = ${WG_SERVER_PRIV}
+PostUp = iptables -t nat -A POSTROUTING -s 10.0.20.0/24 -o ${IFACE} -j MASQUERADE; iptables -A FORWARD -s 10.0.20.0/24 -j ACCEPT; iptables -A FORWARD -d 10.0.20.0/24 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -s 10.0.20.0/24 -o ${IFACE} -j MASQUERADE; iptables -D FORWARD -s 10.0.20.0/24 -j ACCEPT; iptables -D FORWARD -d 10.0.20.0/24 -j ACCEPT
+
+[Peer]
+PublicKey = ${WG_CLIENT1_PUB}
+AllowedIPs = 10.0.20.2/32
+WGCFGEOF
+echo "[+] WireGuard config written"
+
 # ── 15. Firewall (whitelist) ───────────────────────────
 echo "[*] Configuring firewall..."
 # Flush existing rules
@@ -875,6 +1031,10 @@ iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 # Allow DHCP
 iptables -A INPUT -p udp --dport 68 -j ACCEPT
+# Allow WireGuard
+iptables -A INPUT -p udp --dport 51820 -j ACCEPT
+# Allow dashboard from WG subnet
+iptables -A INPUT -s 10.0.20.0/24 -p tcp --dport 8080 -j ACCEPT
 # MSS clamp on :443 — fixes "client connects but no traffic" when upstream
 # link has MTU<1500 and PMTU discovery fails (some hosting providers / RU ISPs)
 iptables -t mangle -A POSTROUTING -p tcp --sport 443 --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
@@ -900,7 +1060,7 @@ chmod 600 /opt/vpn-dashboard/clients.json
 # ── 17. Start services ──────────────────────────────────
 echo "[*] Starting services..."
 systemctl daemon-reload
-systemctl enable --now xray vpn-dashboard fail2ban
+systemctl enable --now xray vpn-dashboard fail2ban wg-quick@wg0
 sleep 2
 
 XRAY_OK=$(systemctl is-active xray)
@@ -916,7 +1076,7 @@ echo "0 11 * * * /sbin/reboot" | crontab -
 echo "[+] Daily reboot scheduled"
 
 # ── 19. Output ──────────────────────────────────────────
-VLESS_LINK="vless://${CLIENT_UUID}@${SERVER_IP}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.google.com&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#VPN"
+VLESS_LINK="vless://${CLIENT_UUID}@${SERVER_IP}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#VPN"
 
 echo ""
 echo "  ╔══════════════════════════════════════╗"
@@ -934,6 +1094,13 @@ echo "  -- QR Code (scan in v2rayNG) --"
 echo ""
 qrencode -t ansiutf8 "$VLESS_LINK"
 echo ""
+echo "  -- WireGuard (альтернативный протокол) --"
+echo ""
+echo "  Сервер:   ${SERVER_IP}:51820 (UDP)"
+echo "  Подсеть:  10.0.20.0/24"
+echo "  Публичный ключ сервера: ${WG_SERVER_PUB}"
+echo "  Конфиг для клиента в дашборде (вкладка WireGuard)"
+echo ""
 echo "  -- DNS Leak Protection --"
 echo ""
 echo "  Server: DoH (Cloudflare + Google) via Xray"
@@ -947,13 +1114,24 @@ VPN Server Credentials — Generated: ${NOW}
 
 Server IP:     ${SERVER_IP}
 Port:          443
-Protocol:      VLESS + REALITY
+Protocol:      VLESS + REALITY (Xray)
 Public Key:    ${PUB_KEY}
 Short ID:      ${SHORT_ID}
 Client UUID:   ${CLIENT_UUID}
 
 VLESS Link:
 ${VLESS_LINK}
+
+--- WireGuard ---
+
+Endpoint:        ${SERVER_IP}:51820 (UDP)
+Subnet:          10.0.20.0/24
+Server Address:  10.0.20.1
+Server Public:   ${WG_SERVER_PUB}
+Client Address:  10.0.20.2
+DNS:             1.1.1.1, 8.8.8.8
+
+Сгенерировать конфиг можно в дашборде: http://${SERVER_IP}:8080 (вкладка WireGuard)
 
 Dashboard: http://${SERVER_IP}:8080 (via VPN only)
 
